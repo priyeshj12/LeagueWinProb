@@ -138,10 +138,72 @@ def dataset_from_games(
     )
 
 
+#: Ridge strengths tried when the caller asks for automatic selection.
+L2_GRID = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0)
+
+
+def select_l2(
+    dataset: Dataset,
+    grid: Sequence[float] = L2_GRID,
+    folds: int = 3,
+    seed: int = 0,
+    live_weight: float = 1.0,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """Choose the ridge penalty by cross-validated held-out log loss.
+
+    How much regularisation is right depends entirely on how much data there
+    is. A few hundred real matches against eighty-five parameters need an order
+    of magnitude more shrinkage than several thousand simulated games do, and a
+    fixed default is wrong for one of those cases whichever value it takes.
+    Folds split by game, never by frame, for the same reason the train/test
+    split does: states from one match share a winner and most of their
+    features.
+    """
+    games = np.unique(dataset.groups)
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(games)
+    assignment = {
+        int(game): index % folds for index, game in enumerate(shuffled)
+    }
+    fold_of = np.array([assignment[int(g)] for g in dataset.groups])
+
+    results: List[Dict[str, Any]] = []
+    for l2 in grid:
+        scores: List[float] = []
+        for fold in range(folds):
+            train = dataset.subset(fold_of != fold)
+            test = dataset.subset(fold_of == fold)
+            if not len(train) or not len(test):
+                continue
+            model = AdditiveWinModel(feature_keys=list(FEATURE_KEYS))
+            model.set_knots_from_data(train.values, train.masks)
+            augmented, weights = train.augmented_for_training(live_weight=live_weight)
+            model.fit(
+                augmented.values, augmented.masks, augmented.times, augmented.labels,
+                l2=l2, sample_weight=weights,
+            )
+            scores.append(
+                calibrate.log_loss(
+                    test.labels,
+                    model.predict_proba(test.values, test.masks, test.times),
+                )
+            )
+        if scores:
+            mean = float(np.mean(scores))
+            results.append({"l2": float(l2), "log_loss": mean})
+            if progress is not None:
+                progress(f"  l2={l2:>7.1f}   cv log loss {mean:.4f}")
+
+    if not results:
+        return 2.0, results
+    return float(min(results, key=lambda row: row["log_loss"])["l2"]), results
+
+
 def train_model(
     dataset: Dataset,
     *,
-    l2: float = 2.0,
+    l2: Optional[float] = 2.0,
     test_fraction: float = 0.2,
     seed: int = 0,
     live_weight: float = 1.0,
@@ -151,6 +213,13 @@ def train_model(
 ) -> Tuple[AdditiveWinModel, Dict[str, Any]]:
     """Fit a model and score it on held-out games."""
     train, test = dataset.split_by_game(test_fraction=test_fraction, seed=seed)
+
+    l2_search: List[Dict[str, Any]] = []
+    if l2 is None:
+        l2, l2_search = select_l2(
+            train, seed=seed, live_weight=live_weight,
+            progress=(lambda line: print(line)) if verbose else None,
+        )
 
     model = AdditiveWinModel(feature_keys=list(FEATURE_KEYS))
     model.set_knots_from_data(train.values, train.masks)
@@ -169,6 +238,8 @@ def train_model(
     )
 
     report: Dict[str, Any] = {
+        "l2": float(l2),
+        "l2_search": l2_search,
         "fit": fit_stats,
         "n_games": dataset.n_games,
         "n_states": len(dataset),
@@ -196,7 +267,7 @@ def train_model(
 def train_synthetic(
     n_games: int = 4000,
     seed: int = 7,
-    l2: float = 2.0,
+    l2: Optional[float] = 2.0,
     progress: Optional[Callable[[int, int], None]] = None,
     verbose: bool = False,
 ) -> Tuple[AdditiveWinModel, Dict[str, Any]]:
@@ -217,7 +288,7 @@ def train_synthetic(
             "trained_on": "simulated",
             "n_games": n_games,
             "seed": seed,
-            "l2": l2,
+            "l2": report.get("l2"),
             "note": (
                 "Fit on simulated Summoner's Rift games. Run 'rift-oracle harvest' "
                 "then 'rift-oracle train --data <dir>' to refit on real matches."
@@ -291,7 +362,7 @@ def load_harvested(
 
 def train_from_directory(
     directory: Path,
-    l2: float = 2.0,
+    l2: Optional[float] = 2.0,
     limit: Optional[int] = None,
     seed: int = 0,
     progress: Optional[Callable[[int, int], None]] = None,
@@ -306,7 +377,7 @@ def train_from_directory(
             "n_games": dataset.n_games,
             "n_states": len(dataset),
             "source_dir": str(directory),
-            "l2": l2,
+            "l2": report.get("l2"),
         }
     )
     return model, report
@@ -321,6 +392,9 @@ def format_report(report: Dict[str, Any]) -> str:
         f"games in {fit.get('iterations', 0)} Newton steps"
     )
     lines.append(f"side bias: {fit.get('side_bias', 0.0):+.4f} logit (blue-side edge)")
+    if report.get("l2") is not None:
+        how = " (cross-validated)" if report.get("l2_search") else ""
+        lines.append(f"ridge penalty: {report['l2']:g}{how}")
 
     test = report.get("test")
     if test:

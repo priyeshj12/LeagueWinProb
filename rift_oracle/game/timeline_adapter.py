@@ -90,6 +90,29 @@ def team_of_participant(participant_id: int) -> int:
     return BLUE if int(participant_id) <= 5 else RED
 
 
+def event_team(event: Dict[str, Any], *fields: str) -> Optional[int]:
+    """Read a side out of an event, or ``None`` when it names no real side.
+
+    Real timelines do not always name one. Riot records a Rift Herald or a
+    voidgrub taken without a champion last-hit as ``killerTeamId: 300`` with no
+    ``killerId`` at all, and ``DRAGON_SOUL_GIVEN`` ships ``teamId: 0``.
+
+    Both used to land on blue, because ``int(event.get("teamId") or BLUE)``
+    treats 0 as absent - so every dragon soul in every game was credited to
+    blue side. Returning ``None`` and letting the caller skip or infer is the
+    only honest handling: an unattributable objective belongs to nobody.
+    """
+    for field in fields:
+        value = event.get(field)
+        if value is not None and int(value) in (BLUE, RED):
+            return int(value)
+
+    killer = int(event.get("killerId") or 0)
+    if killer:
+        return team_of_participant(killer)
+    return None
+
+
 class _Inventory:
     """Tracks one participant's items so item value can be valued per frame."""
 
@@ -257,9 +280,18 @@ class TimelineReplay:
             },
         )
 
-    def _on_building_kill(self, event: Dict[str, Any], t: float) -> GameEvent:
-        # ``teamId`` is the team that OWNED the destroyed building.
-        loser = int(event.get("teamId") or BLUE)
+    def _on_building_kill(self, event: Dict[str, Any], t: float) -> Optional[GameEvent]:
+        # ``teamId`` is the team that OWNED the destroyed building, so the
+        # taker is the other side. A killer-based fallback would name the taker
+        # directly, so invert it back before using it as the loser.
+        named = event.get("teamId")
+        if named is not None and int(named) in (BLUE, RED):
+            loser = int(named)
+        else:
+            taker_guess = event_team(event)
+            if taker_guess is None:
+                return None
+            loser = other_team(taker_guess)
         taker = other_team(loser)
         building = str(event.get("buildingType") or "")
         lane = str(event.get("laneType") or "").replace("_LANE", "").title()
@@ -288,11 +320,12 @@ class TimelineReplay:
             payload={"lane": lane, "building": building, "tower": event.get("towerType")},
         )
 
-    def _on_elite_monster_kill(self, event: Dict[str, Any], t: float) -> GameEvent:
-        killer_team = event.get("killerTeamId")
+    def _on_elite_monster_kill(self, event: Dict[str, Any], t: float) -> Optional[GameEvent]:
+        killer_team = event_team(event, "killerTeamId")
         if killer_team is None:
-            killer_team = team_of_participant(int(event.get("killerId") or 1))
-        killer_team = int(killer_team)
+            # Neutral kill with no attributable champion. Crediting a side here
+            # would invent an objective lead out of a data quirk.
+            return None
         monster = str(event.get("monsterType") or "")
         subtype = str(event.get("monsterSubType") or "")
 
@@ -347,8 +380,15 @@ class TimelineReplay:
             payload={"monster": monster},
         )
 
-    def _on_turret_plate_destroyed(self, event: Dict[str, Any], t: float) -> GameEvent:
-        loser = int(event.get("teamId") or BLUE)
+    def _on_turret_plate_destroyed(self, event: Dict[str, Any], t: float) -> Optional[GameEvent]:
+        named = event.get("teamId")
+        if named is not None and int(named) in (BLUE, RED):
+            loser = int(named)
+        else:
+            taker_guess = event_team(event)
+            if taker_guess is None:
+                return None
+            loser = other_team(taker_guess)
         taker = other_team(loser)
         self._objectives[taker]["plates"] += 1
         lane = str(event.get("laneType") or "").replace("_LANE", "").title()
@@ -361,8 +401,12 @@ class TimelineReplay:
             payload={"lane": lane},
         )
 
-    def _on_dragon_soul_given(self, event: Dict[str, Any], t: float) -> GameEvent:
-        team = int(event.get("teamId") or BLUE)
+    def _on_dragon_soul_given(self, event: Dict[str, Any], t: float) -> Optional[GameEvent]:
+        # This event arrives with teamId 0, so the owner is inferred from who
+        # actually has the four drakes by now.
+        team = event_team(event, "teamId") or self._soul_owner()
+        if team is None:
+            return None
         name = str(event.get("name") or "").title()
         self._objectives[team]["soul"] = name or "Dragon"
         return GameEvent(
@@ -373,6 +417,15 @@ class TimelineReplay:
             importance=7.0,
             payload={"soul": name},
         )
+
+    def _soul_owner(self) -> Optional[int]:
+        """Whichever side has enough drakes for the soul, if exactly one does."""
+        qualified = [
+            team
+            for team in (BLUE, RED)
+            if len(self._objectives[team]["dragons"]) >= SOUL_AT
+        ]
+        return qualified[0] if len(qualified) == 1 else None
 
     def _on_item_purchased(self, event: Dict[str, Any], t: float) -> Optional[GameEvent]:
         pid = int(event.get("participantId") or 0)
@@ -431,8 +484,10 @@ class TimelineReplay:
             self._last_death_level[pid] = int(event.get("level") or 1)
         return None
 
-    def _on_game_end(self, event: Dict[str, Any], t: float) -> GameEvent:
-        winner = int(event.get("winningTeam") or self.winner or BLUE)
+    def _on_game_end(self, event: Dict[str, Any], t: float) -> Optional[GameEvent]:
+        winner = event_team(event, "winningTeam") or self.winner
+        if winner is None:
+            return None
         return GameEvent(
             t=t,
             type="GAME_END",

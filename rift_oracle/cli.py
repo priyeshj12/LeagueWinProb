@@ -705,11 +705,13 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     console = _console(args)
 
+    l2 = None if str(args.l2).lower() == "auto" else float(args.l2)
+
     if args.data:
         console.print(f"training on real matches in {args.data}")
         with console.status("replaying timelines..."):
             model, report = train_from_directory(
-                Path(args.data), l2=args.l2, limit=args.limit, verbose=args.verbose
+                Path(args.data), l2=l2, limit=args.limit, verbose=args.verbose
             )
     else:
         console.print(
@@ -718,7 +720,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         )
         with console.status("simulating and fitting..."):
             model, report = train_synthetic(
-                n_games=args.games, seed=args.seed, l2=args.l2, verbose=args.verbose
+                n_games=args.games, seed=args.seed, l2=l2, verbose=args.verbose
             )
 
     console.print()
@@ -1188,7 +1190,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--data", help="directory of harvested matches (default: simulate)")
     p_train.add_argument("--games", type=int, default=6000, help="games to simulate")
     p_train.add_argument("--limit", type=int, help="cap on harvested matches to use")
-    p_train.add_argument("--l2", type=float, default=2.0, help="ridge penalty")
+    p_train.add_argument(
+        "--l2", default="auto",
+        help="ridge penalty, or 'auto' to cross-validate it (default: auto)",
+    )
     p_train.add_argument("--seed", type=int, default=7)
     p_train.add_argument("--out", help="write the model here instead of the default location")
     p_train.add_argument("--report", help="write the training report as JSON")

@@ -123,3 +123,61 @@ def test_sigmoid_is_stable_at_extremes():
     assert sigmoid(-10000.0) == pytest.approx(0.0, abs=1e-12)
     assert sigmoid(10000.0) == pytest.approx(1.0, abs=1e-12)
     assert np.isfinite(sigmoid(np.array([-1e9, 0.0, 1e9]))).all()
+
+
+def test_l2_selection_prefers_more_shrinkage_on_less_data():
+    """The cross-validated penalty has to respond to sample size.
+
+    A fixed default is wrong for one of the two regimes this tool runs in:
+    a few hundred real matches against eighty-five parameters need far more
+    shrinkage than several thousand simulated games do.
+    """
+    from rift_oracle.model.train import Dataset, select_l2
+    from rift_oracle.sim.synth import simulate_dataset
+
+    def build(n_games):
+        arrays = simulate_dataset(n_games=n_games, seed=5)
+        return Dataset(
+            values=arrays["values"], masks=arrays["masks"], times=arrays["times"],
+            labels=arrays["labels"], groups=arrays["groups"],
+        )
+
+    small_l2, small_search = select_l2(build(25), grid=(1.0, 8.0, 64.0), folds=2)
+    large_l2, large_search = select_l2(build(400), grid=(1.0, 8.0, 64.0), folds=2)
+
+    assert small_search and large_search
+    assert all(row["log_loss"] == row["log_loss"] for row in small_search)
+    assert small_l2 >= large_l2
+
+
+def test_l2_selection_splits_folds_by_game():
+    """Splitting by row would leak a game's winner across the fold boundary."""
+    import numpy as np
+
+    from rift_oracle.model.train import Dataset, select_l2
+    from rift_oracle.sim.synth import simulate_dataset
+
+    arrays = simulate_dataset(n_games=30, seed=6)
+    dataset = Dataset(
+        values=arrays["values"], masks=arrays["masks"], times=arrays["times"],
+        labels=arrays["labels"], groups=arrays["groups"],
+    )
+    chosen, search = select_l2(dataset, grid=(2.0,), folds=3)
+    assert chosen == 2.0
+    assert len(search) == 1
+    # Every state of a game must land in the same fold, which is what makes the
+    # held-out score mean anything.
+    assert np.unique(dataset.groups).size == 30
+
+
+def test_an_empty_grid_falls_back_to_a_sane_default():
+    from rift_oracle.model.train import Dataset, select_l2
+    from rift_oracle.sim.synth import simulate_dataset
+
+    arrays = simulate_dataset(n_games=5, seed=1)
+    dataset = Dataset(
+        values=arrays["values"], masks=arrays["masks"], times=arrays["times"],
+        labels=arrays["labels"], groups=arrays["groups"],
+    )
+    chosen, search = select_l2(dataset, grid=(), folds=2)
+    assert chosen == 2.0 and search == []

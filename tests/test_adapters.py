@@ -259,6 +259,115 @@ def test_events_produce_extra_states_at_their_own_timestamps():
     assert any(abs(state.t - 90.0) < 1.0 for state in at_events)
 
 
+# -- team ids that real timelines actually contain -------------------------
+#
+# These three shapes all appear in live EUW ranked data and all used to be
+# mis-credited, because `int(event.get("teamId") or BLUE)` reads a literal 0
+# as "absent" and falls through to blue.
+
+
+def test_dragon_soul_with_team_id_zero_goes_to_whoever_has_the_drakes():
+    """Riot ships DRAGON_SOUL_GIVEN with teamId 0, so the owner is inferred.
+
+    Before this was handled, every dragon soul in every game was credited to
+    blue side.
+    """
+    drakes = [
+        {
+            "timestamp": 10000 + i * 1000,
+            "type": "ELITE_MONSTER_KILL",
+            "killerTeamId": RED,
+            "monsterType": "DRAGON",
+            "monsterSubType": "AIR_DRAGON",
+            "killerId": 6,
+        }
+        for i in range(4)
+    ]
+    soul = {"timestamp": 20000, "type": "DRAGON_SOUL_GIVEN", "teamId": 0, "name": "Cloud"}
+    states, _replay = _run(_timeline(drakes + [soul]))
+    final = states[-1]
+    assert final.red.soul_type == "Cloud"
+    assert final.red.has_soul
+    assert not final.blue.has_soul
+
+
+def test_dragon_soul_is_skipped_when_nobody_qualifies():
+    soul = {"timestamp": 20000, "type": "DRAGON_SOUL_GIVEN", "teamId": 0, "name": "Cloud"}
+    states, replay = _run(_timeline([soul]))
+    assert states[-1].blue.soul_type is None
+    assert states[-1].red.soul_type is None
+    assert not any(e.type == "DRAGON_SOUL" for e in replay.events)
+
+
+def test_a_neutral_epic_monster_kill_is_credited_to_nobody():
+    """Herald and voidgrubs taken without a champion last-hit arrive as team 300.
+
+    Riot supplies no killerId for these either, so there is nothing to infer
+    from. Crediting a side would invent an objective lead out of a data quirk.
+    """
+    events = [
+        {
+            "timestamp": 60000,
+            "type": "ELITE_MONSTER_KILL",
+            "killerTeamId": 300,
+            "monsterType": "RIFTHERALD",
+        },
+        {"timestamp": 61000, "type": "ELITE_MONSTER_KILL", "killerTeamId": 300,
+         "monsterType": "HORDE"},
+    ]
+    states, replay = _run(_timeline(events))
+    assert states[-1].blue.heralds == 0
+    assert states[-1].red.heralds == 0
+    assert not any(e.type == "HERALD_KILL" for e in replay.events)
+
+
+def test_an_epic_monster_falls_back_to_the_killer_participant():
+    """A missing killerTeamId is recoverable when a champion is named."""
+    events = [
+        {
+            "timestamp": 60000,
+            "type": "ELITE_MONSTER_KILL",
+            "monsterType": "BARON_NASHOR",
+            "killerId": 7,  # participant 7 is red side
+        }
+    ]
+    states, _replay = _run(_timeline(events))
+    assert states[-1].red.barons == 1
+    assert states[-1].blue.barons == 0
+
+
+def test_building_kill_without_a_usable_team_id_is_skipped():
+    events = [
+        {
+            "timestamp": 60000,
+            "type": "BUILDING_KILL",
+            "teamId": 0,
+            "buildingType": "TOWER_BUILDING",
+            "towerType": "OUTER_TURRET",
+            "laneType": "MID_LANE",
+        }
+    ]
+    states, _replay = _run(_timeline(events))
+    assert states[-1].blue.towers_raw == 0
+    assert states[-1].red.towers_raw == 0
+
+
+def test_building_kill_with_no_team_id_uses_the_killer():
+    events = [
+        {
+            "timestamp": 60000,
+            "type": "BUILDING_KILL",
+            "buildingType": "TOWER_BUILDING",
+            "towerType": "OUTER_TURRET",
+            "laneType": "MID_LANE",
+            "killerId": 2,  # blue took it, so red lost the building
+        }
+    ]
+    states, _replay = _run(_timeline(events))
+    assert states[-1].blue.towers_raw == 1
+    assert states[-1].red.towers_raw == 0
+
+
 def test_game_duration_in_milliseconds_is_normalised():
     match = _match()
     match["info"]["gameDuration"] = 1_800_000

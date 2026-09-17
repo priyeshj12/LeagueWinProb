@@ -205,3 +205,49 @@ def test_spending_gold_is_only_suggested_when_there_is_gold_to_spend(model, game
         player.current_gold = 0.0
     actions, _risks = suggest_actions(state, model, perspective=BLUE)
     assert not any("spend" in s.action.lower() for s in actions)
+
+
+def test_a_headline_names_an_event_that_helped_the_side_the_swing_helped():
+    """A window can hold good news for both teams; the headline must pick right.
+
+    Seen on a real EUW game: Blue took a turret inside a window that swung
+    fourteen points to Red, and the headline credited the turret.
+    """
+    from rift_oracle.analysis.narrate import narrate_swing
+    from rift_oracle.analysis.swings import Swing
+    from rift_oracle.game.state import GameEvent
+
+    swing = Swing(
+        start_t=900.0,
+        end_t=1020.0,
+        p_before=0.72,
+        p_after=0.58,  # fourteen points toward Red
+        attributions=[("kill_diff", -0.09), ("tower_diff", -0.05)],
+        events=[
+            GameEvent(t=950.0, type="TURRET_KILL", team=BLUE,
+                      text="Blue took the Bot Outer turret", importance=2.0),
+            GameEvent(t=1000.0, type="CHAMPION_KILL", team=RED,
+                      text="Samira killed Jinx", importance=1.0),
+        ],
+    )
+    headline = narrate_swing(swing).headline
+    assert "Samira killed Jinx" in headline
+    assert "Blue took" not in headline
+
+
+def test_a_headline_falls_back_when_no_event_matches_the_direction():
+    from rift_oracle.analysis.narrate import narrate_swing
+    from rift_oracle.analysis.swings import Swing
+    from rift_oracle.game.state import GameEvent
+
+    swing = Swing(
+        start_t=600.0, end_t=690.0, p_before=0.60, p_after=0.46,
+        attributions=[("tower_diff", -0.14)],
+        events=[
+            GameEvent(t=650.0, type="TURRET_KILL", team=BLUE,
+                      text="Blue took the Mid Outer turret", importance=2.0),
+        ],
+    )
+    headline = narrate_swing(swing).headline
+    assert "Blue took" not in headline
+    assert "Red" in headline  # describes the drift instead of miscrediting

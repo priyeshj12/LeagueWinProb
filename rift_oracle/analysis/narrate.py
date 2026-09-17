@@ -26,7 +26,7 @@ from rift_oracle.analysis.swings import (
     bundle_primary,
 )
 from rift_oracle.game.scaling import biggest_scalers, crossover_minute
-from rift_oracle.game.state import BLUE, GameEvent, GameState
+from rift_oracle.game.state import BLUE, RED, GameEvent, GameState
 from rift_oracle.model.features import SPEC_BY_KEY, display_value
 
 
@@ -100,9 +100,9 @@ def _headline(swing: Swing, gainer: str, before: float, after: float, delta: flo
 
     # Headline from an event that actually moved the odds, choosing the most
     # notable one among the factors that carried the swing. Ranking purely by
-    # contribution would headline a routine kill for the window in which a
-    # team claimed dragon soul, because three combat features sum to more than
-    # the soul feature alone. Requiring a real share of the move first is what
+    # contribution would headline a routine kill for the window in which a team
+    # claimed dragon soul, because three combat features sum to more than the
+    # soul feature alone. Requiring a real share of the move first is what
     # stops the loudest event in the window taking credit for something else.
     candidates = [
         event
@@ -110,8 +110,13 @@ def _headline(swing: Swing, gainer: str, before: float, after: float, delta: flo
         if abs(share) >= swing.magnitude * 0.2
         for event in swing.causes_for(key)
     ]
-    if candidates:
-        best = max(candidates, key=lambda event: (event.importance, event.t))
+    # ...and the event has to have helped the side the swing helped. A window
+    # can contain good news for both teams, and "Blue took the Bot Outer
+    # turret" is a nonsense headline for a swing that went to Red.
+    beneficiary = BLUE if swing.delta > 0 else RED
+    aligned = [event for event in candidates if event.team == beneficiary]
+    if aligned:
+        best = max(aligned, key=lambda event: (event.importance, event.t))
         return f"{best.text}  ({movement}, {points(delta)} {gainer})"
 
     if top_key:
