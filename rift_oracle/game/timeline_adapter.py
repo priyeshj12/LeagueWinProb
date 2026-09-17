@@ -21,6 +21,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from rift_oracle.game.state import (
     BLUE,
     HERALD_WEIGHT,
+    MAX_PLATES_PER_SIDE,
+    MAX_TURRET_WEIGHT,
+    MAX_TURRETS_PER_SIDE,
     RED,
     SOUL_AT,
     TURRET_WEIGHT,
@@ -557,9 +560,10 @@ class TimelineReplay:
         for team_id, side in teams.items():
             obj = self._objectives[team_id]
             enemy_obj = self._objectives[other_team(team_id)]
-            side.towers = obj["towers"]
-            side.towers_raw = obj["towers_raw"]
-            side.turret_plates = obj["plates"]
+            # Clamped to what the map holds; see the caps in game.state for why.
+            side.towers = min(obj["towers"], MAX_TURRET_WEIGHT)
+            side.towers_raw = min(obj["towers_raw"], MAX_TURRETS_PER_SIDE)
+            side.turret_plates = min(obj["plates"], MAX_PLATES_PER_SIDE)
             side.inhibitors_taken = obj["inhibitors"]
             side.inhibitors_down = _inhibs_down(obj["inhibitors_down"], t)
             side.dragons = list(obj["dragons"])

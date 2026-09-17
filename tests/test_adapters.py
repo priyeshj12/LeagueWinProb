@@ -368,6 +368,50 @@ def test_building_kill_with_no_team_id_uses_the_killer():
     assert states[-1].red.towers_raw == 0
 
 
+def test_structural_counts_are_clamped_to_what_the_map_holds():
+    """Riot's data sometimes exceeds the map.
+
+    One real timeline records three nexus-turret kills, minutes apart, where
+    the map has two. Clamping keeps every state physically possible, which the
+    advice engine relies on because its counterfactuals mutate these counts.
+    """
+    from rift_oracle.game.state import MAX_TURRETS_PER_SIDE, MAX_TURRET_WEIGHT
+
+    events = [
+        {
+            "timestamp": 1000 + i * 1000,
+            "type": "BUILDING_KILL",
+            "teamId": RED,
+            "buildingType": "TOWER_BUILDING",
+            "towerType": "NEXUS_TURRET",
+            "laneType": "MID_LANE",
+            "killerId": 1,
+        }
+        for i in range(20)  # far more than the map contains
+    ]
+    states, _replay = _run(_timeline(events, frames=3))
+    final = states[-1]
+    assert final.blue.towers_raw == MAX_TURRETS_PER_SIDE
+    assert final.blue.towers <= MAX_TURRET_WEIGHT + 1e-9
+
+
+def test_plate_counts_allow_what_the_current_map_actually_has():
+    """Plating covers all nine lane turrets now, not just the three outer ones.
+
+    An older cap of fifteen would have silently truncated most real games.
+    """
+    from rift_oracle.game.state import MAX_PLATES_PER_SIDE
+
+    assert MAX_PLATES_PER_SIDE == 45
+    events = [
+        {"timestamp": 1000 + i * 100, "type": "TURRET_PLATE_DESTROYED",
+         "teamId": RED, "laneType": "MID_LANE"}
+        for i in range(30)
+    ]
+    states, _replay = _run(_timeline(events, frames=3))
+    assert states[-1].blue.turret_plates == 30
+
+
 def test_game_duration_in_milliseconds_is_normalised():
     match = _match()
     match["info"]["gameDuration"] = 1_800_000

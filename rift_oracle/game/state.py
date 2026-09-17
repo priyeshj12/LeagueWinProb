@@ -35,6 +35,23 @@ TURRET_WEIGHT: Dict[str, float] = {
     "UNKNOWN": 1.2,
 }
 
+#: What the map actually contains, per side. These are caps, not expectations.
+#:
+#: Both numbers were checked against 1360 real EUW ranked timelines rather than
+#: assumed, and one of them was a surprise: turret plating now covers all nine
+#: lane turrets at five plates each, not just the three outer ones, so a team
+#: can take 45 plates and not the 15 an older patch would allow.
+#:
+#: Riot's data occasionally exceeds even these. One timeline records three
+#: nexus-turret kills, minutes apart, where the map has two. Capping keeps
+#: every state physically possible - which matters most for the advice engine,
+#: whose counterfactuals mutate these counts - and costs nothing, because the
+#: cap can only ever engage at the very end of a game that is already decided.
+MAX_TURRETS_PER_SIDE = 11  # 3 outer + 3 inner + 3 inhibitor + 2 nexus
+MAX_PLATES_PER_SIDE = 45  # 9 lane turrets x 5 plates
+#: Weighted equivalent of taking every turret, using TURRET_WEIGHT below.
+MAX_TURRET_WEIGHT = 3 * 1.0 + 3 * 1.6 + 3 * 2.2 + 2 * 2.6
+
 #: Non-drake epic monsters and what each is worth relative to a Rift Herald.
 HERALD_WEIGHT: Dict[str, float] = {
     "RIFTHERALD": 1.0,

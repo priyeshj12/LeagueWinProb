@@ -34,6 +34,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from rift_oracle.game.state import (
     BLUE,
+    MAX_PLATES_PER_SIDE,
+    MAX_TURRET_WEIGHT,
+    MAX_TURRETS_PER_SIDE,
     RED,
     SOUL_AT,
     TURRET_WEIGHT,
@@ -437,9 +440,9 @@ class LiveGameTracker:
     def _apply_objective_state(self, teams: Dict[int, TeamState], t: float) -> None:
         for team_id, side in teams.items():
             obj = self._objectives[team_id]
-            side.towers = obj["towers"]
-            side.towers_raw = obj["towers_raw"]
-            side.turret_plates = obj["plates"]
+            side.towers = min(obj["towers"], MAX_TURRET_WEIGHT)
+            side.towers_raw = min(obj["towers_raw"], MAX_TURRETS_PER_SIDE)
+            side.turret_plates = min(obj["plates"], MAX_PLATES_PER_SIDE)
             side.inhibitors_taken = obj["inhibitors"]
             side.inhibitors_down = len(obj["inhibitors_down"])
             side.dragons = list(obj["dragons"])
