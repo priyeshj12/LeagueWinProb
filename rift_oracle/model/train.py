@@ -236,9 +236,18 @@ def train_model(
     live_weight: float = 1.0,
     fit_side_bias: bool = True,
     monotone: bool = True,
+    refit_on_all: bool = False,
     verbose: bool = False,
 ) -> Tuple[AdditiveWinModel, Dict[str, Any]]:
-    """Fit a model and score it on held-out games."""
+    """Fit a model and score it on held-out games.
+
+    With ``refit_on_all`` the returned model is refit on the whole dataset once
+    the held-out scores have been taken. That is the standard split of duties:
+    the held-out games estimate how well this recipe generalises, and the
+    shipped model uses every game available to it. The report says which is
+    which so the numbers are never mistaken for the shipped model's training
+    performance.
+    """
     train, test = dataset.split_by_game(test_fraction=test_fraction, seed=seed)
 
     l2_search: List[Dict[str, Any]] = []
@@ -285,6 +294,19 @@ def train_model(
         report["calibration"] = calibrate.calibration_gain(test.labels, full_p)
         report["reliability"] = calibrate.reliability_table(test.labels, full_p, bins=10)
 
+    if refit_on_all and len(test):
+        final = AdditiveWinModel(feature_keys=list(FEATURE_KEYS))
+        final.set_knots_from_data(dataset.values, dataset.masks)
+        augmented_all, weights_all = dataset.augmented_for_training(live_weight=live_weight)
+        final.fit(
+            augmented_all.values, augmented_all.masks, augmented_all.times,
+            augmented_all.labels, l2=l2, sample_weight=weights_all,
+            fit_side_bias=fit_side_bias, monotone=monotone, verbose=verbose,
+        )
+        report["refit_on_all"] = True
+        report["refit_games"] = dataset.n_games
+        model = final
+
     report["importance"] = model.feature_importance(
         dataset.values, dataset.masks, dataset.times
     )
@@ -309,7 +331,9 @@ def train_synthetic(
         labels=arrays["labels"],
         groups=arrays["groups"],
     )
-    model, report = train_model(dataset, l2=l2, seed=seed, verbose=verbose)
+    model, report = train_model(
+        dataset, l2=l2, seed=seed, refit_on_all=True, verbose=verbose
+    )
     model.meta.update(
         {
             "trained_on": "simulated",
@@ -397,7 +421,9 @@ def train_from_directory(
 ) -> Tuple[AdditiveWinModel, Dict[str, Any]]:
     """Fit on real harvested matches."""
     dataset = load_harvested(directory, limit=limit, progress=progress)
-    model, report = train_model(dataset, l2=l2, seed=seed, verbose=verbose)
+    model, report = train_model(
+        dataset, l2=l2, seed=seed, refit_on_all=True, verbose=verbose
+    )
     model.meta.update(
         {
             "trained_on": "riot-matches",
@@ -436,6 +462,11 @@ def format_report(report: Dict[str, Any]) -> str:
         lines.append(
             f"live-masked (no XP/damage) -> log loss {masked['log_loss']:.4f} | "
             f"acc {masked['accuracy'] * 100:.1f}%"
+        )
+    if report.get("refit_on_all"):
+        lines.append(
+            f"shipped model refit on all {report.get('refit_games', 0):,} games "
+            "(the scores above are held-out estimates of the recipe, not of this fit)"
         )
     gain = report.get("calibration", {}).get("gain")
     if gain is not None and gain == gain:

@@ -18,7 +18,8 @@ Three things make it more than a number:
 - **It knows what it cannot see.** The in-client API reports your gold but not
   your team's; a match timeline reports everything but only after the game. The
   model is trained under both regimes and masked features contribute exactly
-  zero rather than a guess.
+  zero rather than a guess — which costs 1.6 points of probability on average,
+  measured on real games.
 - **Its advice is the same model, run backwards.** Every suggestion is a real
   counterfactual: take this dragon, re-ask the model, report the difference.
 
@@ -32,6 +33,7 @@ cd LeagueWinProb
 pip install -e .
 
 rift-oracle demo            # full pipeline on a simulated game, no key needed
+                            # (the shipped model itself is fit on real EUW games)
 rift-oracle doctor          # check key, network, client, model
 ```
 
@@ -195,27 +197,58 @@ losing anyway.
 
 ## Training
 
-The bundled model is fit on 6,000 simulated Summoner's Rift games, so the tool
-works with no key, no network and no data. The simulator is a real generative
-model — persistent skill gaps, composition scaling, snowballing, bounties as
-negative feedback, and a siege hazard so games end when someone has pressure
-rather than at a fixed clock. Games are played to the nexus falling, which
-means the label comes from the same process as the features and the resulting
-probabilities are calibrated by construction.
-
-Held out on 1,200 unseen simulated games:
+The bundled model is fit on **1,656 real EUW ranked solo-queue games** (patches
+16.1–16.18, seeded across the ladder from Bronze to Master). Held out on 331
+games it never saw:
 
 | metric | value |
 |---|---|
-| log loss | 0.499 |
-| Brier | 0.168 |
-| AUC | 0.831 |
-| accuracy | 74.1% |
-| expected calibration error | 1.6% |
+| log loss | 0.509 |
+| Brier | 0.171 |
+| AUC | 0.826 |
+| accuracy | 73.6% |
+| expected calibration error | 2.8% |
 
-Accuracy by game clock runs 64% in the first ten minutes to 85% after thirty,
-which is the shape a real win-probability model has: early states genuinely do
-not determine outcomes.
+Accuracy by game clock runs 63% in the first ten minutes to 81% after
+twenty-five, which is the shape a win-probability model should have: early
+states genuinely do not determine outcomes. Those numbers estimate the recipe;
+the shipped model is then refit on all 1,656 games.
+
+### The simulator, and whether it was needed
+
+There is also a generative simulator — persistent skill gaps, composition
+scaling, snowballing, bounties as negative feedback, and a siege hazard so
+games end when someone has pressure rather than at a fixed clock. Games are
+played through to the nexus falling, so the label comes from the same process
+as the features and the probabilities are calibrated by construction. It is
+what makes `demo` work with no key and no network, and what `train` falls back
+to when there is no harvested data.
+
+It also turned out to be a reasonable stand-in for the real thing. Scored on
+real EUW games across five repeated game-level splits:
+
+| model | log loss | AUC | accuracy |
+|---|---|---|---|
+| fit on 6,000 simulated games | 0.550 ± 0.017 | 0.793 ± 0.015 | 70.8% |
+| fit on real EUW games | 0.531 ± 0.019 | 0.806 ± 0.015 | 71.4% |
+
+Real data wins every split, by a consistent 0.018 nats — so the bundled model
+is the real-data one. But a model that never saw a real game lands within two
+points of accuracy of one that trained on a thousand, which says the
+constraints are doing most of the work: antisymmetry, monotonicity, and the
+additive form encode enough about League that the data mostly confirms them.
+
+The real-data model stops improving somewhere around 400–800 games, so
+harvesting thousands more is not where the next gain is.
+
+### What real data corrected
+
+Fitting on real games moved one estimate a long way. In the simulator,
+composition scaling is a first-class driver, and the most extreme draft
+imaginable (Kayle/Vayne/Veigar/Nasus/Kassadin against Lee Sin/Pantheon/
+Renekton/Draven/Elise) swings 17 points across a game. On real EUW ranked data
+the same draft is worth about 8. Drafts matter, and they matter about half as
+much as the simulator assumed.
 
 The ridge penalty is cross-validated by default (`--l2 auto`), because the
 right amount of shrinkage depends on how much data there is — a few hundred
@@ -231,7 +264,7 @@ a gold lead runs to tens of thousands of units while composition scaling lives
 inside ±0.6 — so uniform shrinkage deletes the informative small-scale features
 first.
 
-To fit on real matches instead:
+### Fitting it yourself
 
 ```bash
 rift-oracle harvest --ladder --count 800      # seeds across the whole ladder
@@ -257,6 +290,11 @@ under both.
 `backtest` reports a reliability table and how much an isotonic recalibration
 would buy. On a well-fit model the answer is approximately nothing, which is
 the point.
+
+Hiding what a live game cannot see — experience and damage dealt — costs almost
+nothing on real held-out games: log loss 0.5090 to 0.5112, accuracy 72.7% to
+72.6%, and the reported probability moves 1.6 points on average. That is the
+payoff for training each game twice, once fully observed and once masked.
 
 ---
 
@@ -302,9 +340,10 @@ spend the budget that match downloads need on `europe`.
 
 ## Limitations
 
-- The bundled model is fit on simulated games. It is calibrated and its
-  coefficients are sensibly ordered, but it is a prior, not a measurement of
-  the current patch. `harvest` and `train --data` replace it.
+- The bundled model is fit on EUW ranked solo queue, patches 16.1–16.18. League
+  dynamics travel well between regions, but it is not a measurement of your
+  patch or your queue. `harvest --ladder` and `train --data` replace it in
+  about an hour of API budget.
 - Live-mode team gold is estimated, typically within a few hundred per team.
 - `watch` cannot see live gold or kills, because Riot does not expose them.
 - Development API keys expire every 24 hours. `doctor` tells you when yours has.

@@ -164,8 +164,14 @@ def test_draft_projection_reflects_which_composition_scales(model, capsys):
         state = _draft_state(game, blue, red, minute * 60.0)
         return model.predict(extract(state)).p
 
-    assert odds_at(5, late, early) < 0.45
-    assert odds_at(40, late, early) > 0.55
+    # Assert the shape, not a particular effect size: how much a draft is
+    # worth is an empirical question and the answer differs between the
+    # simulator and real ranked games. Fitting on real EUW data puts an extreme
+    # scaling draft at about eight points of swing across a game, where the
+    # simulator said seventeen. What must hold either way is that the edge
+    # starts against the scaling side and ends with it.
+    assert odds_at(5, late, early) < 0.50
+    assert odds_at(40, late, early) > 0.50
 
     # For a fixed draft the projection must not go backwards. It used to:
     # scaling_diff already contains the clock, so interacting it with the clock
