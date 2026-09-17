@@ -143,3 +143,45 @@ def test_configure_round_trips(monkeypatch, tmp_path, capsys):
     stored = json.loads((tmp_path / "config.json").read_text())
     assert stored["api_key"] == "RGAPI-test-key"
     assert stored["platform"] == "euw1"
+
+
+def test_draft_projection_reflects_which_composition_scales(model, capsys):
+    """Spectator only sees the draft, but the draft determines the whole curve.
+
+    A hyper-scaling side should start behind and end ahead, crossing near the
+    composition crossover; a mirror draft should stay flat.
+    """
+    from rich.console import Console
+
+    from rift_oracle.cli import _draft_state, _print_draft_projection
+    from rift_oracle.model.features import extract
+
+    game = {"gameId": 1, "gameQueueConfigId": 420, "gameLength": 0}
+    late = ["Kayle", "Vayne", "Veigar", "Nasus", "Kassadin"]
+    early = ["Lee Sin", "Pantheon", "Renekton", "Draven", "Elise"]
+
+    def odds_at(minute, blue, red):
+        state = _draft_state(game, blue, red, minute * 60.0)
+        return model.predict(extract(state)).p
+
+    assert odds_at(5, late, early) < 0.45
+    assert odds_at(40, late, early) > 0.55
+
+    # For a fixed draft the projection must not go backwards. It used to:
+    # scaling_diff already contains the clock, so interacting it with the clock
+    # again made it quadratic in time and the curve dipped before it rose,
+    # which reads as "your scaling composition got worse as the game moved
+    # toward its power spike". See FeatureSpec.time_interacted.
+    curve = [odds_at(m, late, early) for m in range(0, 46, 5)]
+    assert all(a <= b + 1e-9 for a, b in zip(curve, curve[1:]))
+
+    # It should cross even somewhere around the composition crossover, not at
+    # the start or the end of the game.
+    crossing = next(m for m, p in zip(range(0, 46, 5), curve) if p >= 0.5)
+    assert 15 <= crossing <= 30
+
+    mirror = odds_at(5, late, late), odds_at(40, late, late)
+    assert abs(mirror[0] - mirror[1]) < 0.02
+
+    console = Console(width=90, file=open("/dev/null", "w"))
+    _print_draft_projection(console, model, game, late, early, 0.0, BLUE)

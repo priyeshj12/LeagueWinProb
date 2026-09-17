@@ -404,6 +404,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
     if rank_prior:
         console.print(Text(f"  rank prior: {rank_prior:+.2f} (blue)", style="dim"))
+
+    _print_draft_projection(
+        console, model, game, blue_champions, red_champions, rank_prior, perspective
+    )
     console.print()
 
     track = Track(source="spectator")
@@ -447,6 +451,63 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     match_id = f"{game_id_platform(settings.platform)}_{game_id}"
     return _replay_after_watch(args, console, client, match_id, model, model_path, perspective)
+
+
+def _print_draft_projection(
+    console: Console,
+    model,
+    game: Dict[str, Any],
+    blue_champions: List[str],
+    red_champions: List[str],
+    rank_prior: float,
+    perspective: int,
+) -> None:
+    """Show what the draft alone is worth across the length of a game.
+
+    Spectator sees the draft and the clock and nothing else, so the live
+    readout barely moves - which is honest but not much use on its own. What
+    the draft *does* determine is how its value changes with time, and that is
+    knowable up front: composition scaling is a deterministic function of the
+    clock. Projecting it forward turns "50% and holding" into "50% now, and
+    your draft is worth two more points by 35 minutes, so play for time".
+    """
+    from rift_oracle.model.features import extract
+    from rift_oracle.ui.chart import winprob_chart
+
+    marks = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45]
+    curve = []
+    for minute in marks:
+        state = _draft_state(game, blue_champions, red_champions, minute * 60.0)
+        prediction = model.predict(extract(state, rank_prior=rank_prior))
+        p = prediction.p if perspective == BLUE else 1.0 - prediction.p
+        curve.append((minute * 60.0, p))
+
+    start, end = curve[0][1], curve[-1][1]
+    drift = end - start
+    console.print()
+    console.print(
+        Text("  draft outlook (composition and clock only, before a single minion dies)",
+             style="dim")
+    )
+    console.print(
+        winprob_chart(
+            [t for t, _p in curve], [p for _t, p in curve],
+            width=min(console.width - 4, 78), height=7,
+        )
+    )
+    if abs(drift) < 0.01:
+        verdict = "the clock favours neither draft"
+    elif drift > 0:
+        verdict = (
+            f"your draft gains {drift * 100:.1f} points by 45:00 - the longer this "
+            "goes, the better for you"
+        )
+    else:
+        verdict = (
+            f"your draft loses {abs(drift) * 100:.1f} points by 45:00 - win it early "
+            "or it slips away"
+        )
+    console.print(Text(f"  {verdict}", style="italic"))
 
 
 def game_id_platform(platform: str) -> str:

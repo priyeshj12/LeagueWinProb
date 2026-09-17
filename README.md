@@ -84,6 +84,12 @@ draft and the clock imply, then pulls the full timeline the moment the game
 ends and explains every swing. Add `--ranks` to fold each player's ranked tier
 into a pre-game prior.
 
+Because composition scaling is a known function of the clock, `watch` also
+projects the draft forward before a single minion dies. Kayle/Vayne/Veigar/
+Nasus/Kassadin against Lee Sin/Pantheon/Renekton/Draven/Elise starts near 32%
+and ends near 68%, crossing even right around the 22-minute mark — so the
+readout is not just a number but a plan: play for tempo, or play for time.
+
 **`replay`** is the post-mortem, and the mode with the most to say, because a
 timeline has everything.
 
@@ -201,15 +207,22 @@ Held out on 1,200 unseen simulated games:
 
 | metric | value |
 |---|---|
-| log loss | 0.509 |
-| Brier | 0.171 |
-| AUC | 0.825 |
-| accuracy | 73.7% |
-| expected calibration error | 2.0% |
+| log loss | 0.506 |
+| Brier | 0.170 |
+| AUC | 0.826 |
+| accuracy | 73.9% |
+| expected calibration error | 1.2% |
 
-Accuracy by game clock runs 64% in the first ten minutes to 86% after thirty,
+Accuracy by game clock runs 64% in the first ten minutes to 85% after thirty,
 which is the shape a real win-probability model has: early states genuinely do
 not determine outcomes.
+
+The ridge penalty is cross-validated by default (`--l2 auto`), because the
+right amount of shrinkage depends on how much data there is — a few hundred
+real matches against eighty-five parameters need far more than several thousand
+simulated games do. Above a few hundred games the search runs on a subsample
+and scales the result by the size ratio, which keeps the effective prior fixed
+rather than the penalty.
 
 To fit on real matches instead:
 

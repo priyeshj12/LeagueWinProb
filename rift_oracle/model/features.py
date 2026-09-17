@@ -43,6 +43,16 @@ class FeatureSpec:
     #: Rough magnitude, used to place initial knots before any training data.
     typical: float = 1.0
     group: str = "economy"
+    #: False for features that are already a function of the game clock.
+    #:
+    #: The model multiplies most features by a normalised clock so a 3k gold
+    #: lead can mean different things at ten and at thirty minutes. A feature
+    #: that already contains the clock does not want that: composition scaling
+    #: is defined as ``draft_edge * ramp(t)``, so interacting it with time
+    #: again makes it quadratic in the clock, and a fixed draft's projected
+    #: curve dips before it rises - the model saying a scaling composition got
+    #: worse while the game moved toward its power spike.
+    time_interacted: bool = True
 
 
 FEATURES: Tuple[FeatureSpec, ...] = (
@@ -85,7 +95,7 @@ FEATURES: Tuple[FeatureSpec, ...] = (
                 1.0, "objectives"),
 
     FeatureSpec("scaling_diff", "Composition scaling", "composition scaling", "",
-                1.0, True, 0.2, "draft"),
+                1.0, True, 0.2, "draft", time_interacted=False),
     FeatureSpec("vision_diff", "Vision lead", "vision control", "", 10.0, True,
                 2.0, "macro"),
     FeatureSpec("rank_diff", "Rank prior", "player skill", "", 1.0, True, 0.3,
@@ -98,6 +108,10 @@ SPEC_BY_KEY: Dict[str, FeatureSpec] = {spec.key: spec for spec in FEATURES}
 
 #: Features the Live Client Data API cannot supply.
 LIVE_MASKED: Tuple[str, ...] = tuple(s.key for s in FEATURES if not s.live_observable)
+#: Features that already contain the clock and so skip the time interaction.
+NOT_TIME_INTERACTED: Tuple[str, ...] = tuple(
+    s.key for s in FEATURES if not s.time_interacted
+)
 
 
 @dataclass

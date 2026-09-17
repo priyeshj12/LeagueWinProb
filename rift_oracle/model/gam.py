@@ -174,6 +174,15 @@ class AdditiveWinModel:
         )
         self.side_bias = float(side_bias)
         self.meta: Dict[str, Any] = dict(meta or {})
+        # Zero for features that already contain the clock, which switches off
+        # their time-interaction column without changing the parameter layout.
+        self._time_interaction = np.array(
+            [
+                0.0 if SPEC_BY_KEY[key].time_interacted is False else 1.0
+                for key in self.feature_keys
+            ],
+            dtype=np.float64,
+        )[None, :]
 
     # -- basis ------------------------------------------------------------
 
@@ -211,7 +220,7 @@ class AdditiveWinModel:
         design[:, :, 0] = x
         design[:, :, 1] = sign * np.maximum(magnitude - k1, 0.0)
         design[:, :, 2] = sign * np.maximum(magnitude - k2, 0.0)
-        design[:, :, 3] = x * tau
+        design[:, :, 3] = x * tau * self._time_interaction
         design *= masks[:, :, None]
         return design
 

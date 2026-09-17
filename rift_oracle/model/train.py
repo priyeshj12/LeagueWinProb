@@ -142,12 +142,17 @@ def dataset_from_games(
 L2_GRID = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0)
 
 
+#: Games the search runs on before it starts subsampling.
+L2_SEARCH_MAX_GAMES = 700
+
+
 def select_l2(
     dataset: Dataset,
     grid: Sequence[float] = L2_GRID,
     folds: int = 3,
     seed: int = 0,
     live_weight: float = 1.0,
+    max_games: int = L2_SEARCH_MAX_GAMES,
     progress: Optional[Callable[[str], None]] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """Choose the ridge penalty by cross-validated held-out log loss.
@@ -159,9 +164,30 @@ def select_l2(
     Folds split by game, never by frame, for the same reason the train/test
     split does: states from one match share a winner and most of their
     features.
+
+    The search costs ``len(grid) * folds`` fits, which is unaffordable on tens
+    of thousands of games, so above ``max_games`` it runs on a random subsample
+    and scales the winner by the size ratio. That is not a shortcut: the
+    penalised objective is ``loglik - lambda/2 * ||beta||^2`` and the
+    log-likelihood grows with the sample, so holding ``lambda / n`` fixed is
+    what keeps the same effective prior at a different sample size.
     """
     games = np.unique(dataset.groups)
     rng = np.random.default_rng(seed)
+
+    scale = 1.0
+    if games.size > max_games:
+        keep = set(rng.choice(games, size=max_games, replace=False).tolist())
+        selector = np.array([g in keep for g in dataset.groups])
+        scale = games.size / float(max_games)
+        dataset = dataset.subset(selector)
+        games = np.unique(dataset.groups)
+        if progress is not None:
+            progress(
+                f"  searching on {max_games} of {int(games.size * scale)} games, "
+                f"scaling the result by {scale:.1f}x"
+            )
+
     shuffled = rng.permutation(games)
     assignment = {
         int(game): index % folds for index, game in enumerate(shuffled)
@@ -197,7 +223,8 @@ def select_l2(
 
     if not results:
         return 2.0, results
-    return float(min(results, key=lambda row: row["log_loss"])["l2"]), results
+    best = float(min(results, key=lambda row: row["log_loss"])["l2"])
+    return best * scale, results
 
 
 def train_model(
