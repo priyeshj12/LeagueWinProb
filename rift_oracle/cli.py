@@ -21,7 +21,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from rich.console import Console
 from rich.live import Live
@@ -741,6 +741,8 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def cmd_harvest(args: argparse.Namespace) -> int:
     """Download match + timeline pairs to train on."""
+    import random
+
     from rift_oracle.riot.client import RiotAPIError, RiotClient
 
     console = _console(args)
@@ -751,33 +753,40 @@ def cmd_harvest(args: argparse.Namespace) -> int:
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    seeds: List[str] = []
-    for riot_id in args.riot_id:
-        account = client.resolve_riot_id(riot_id)
-        seeds.append(account["puuid"])
-        console.print(f"  seed {riot_id} -> {account['puuid'][:12]}...")
-
+    seeds = _seed_players(client, args, console)
     if not seeds:
-        console.print(Text("pass at least one --riot-id", style="yellow"))
+        console.print(
+            Text("no seed players. Pass --riot-id, --tier, or --ladder.", style="yellow")
+        )
         return 1
 
-    seen_matches: set = set()
-    seen_puuids: set = set(seeds)
+    rng = random.Random(args.seed)
+    rng.shuffle(seeds)
+    console.print(f"  {len(seeds)} seed players, sampling up to "
+                  f"{args.per_player} games each")
+
+    seen_matches = {path.name.split(".")[0] for path in out_dir.glob("*.match.json")}
+    if seen_matches:
+        console.print(Text(f"  {len(seen_matches)} matches already on disk", style="dim"))
+
     queue = None if args.queue == 0 else args.queue
-    written = 0
-    frontier = list(seeds)
+    written = len(seen_matches)
+    target = args.count
+    failures = 0
 
     with console.status("harvesting...") as status:
-        while frontier and written < args.count:
-            puuid = frontier.pop(0)
+        for puuid in seeds:
+            if written >= target:
+                break
             try:
-                ids = client.match_ids(puuid, count=min(100, args.count), queue=queue)
+                ids = client.match_ids(puuid, count=args.per_player, queue=queue)
             except RiotAPIError as exc:
-                console.print(Text(f"  skipping a player: {exc}", style="dim"))
+                failures += 1
+                log.debug("match ids failed for a player: %s", exc)
                 continue
 
             for match_id in ids:
-                if written >= args.count:
+                if written >= target:
                     break
                 if match_id in seen_matches:
                     continue
@@ -785,39 +794,88 @@ def cmd_harvest(args: argparse.Namespace) -> int:
 
                 match_path = out_dir / f"{match_id}.match.json"
                 timeline_path = out_dir / f"{match_id}.timeline.json"
-                if match_path.is_file() and timeline_path.is_file():
-                    written += 1
-                    continue
-
                 try:
                     match = client.match(match_id)
                     timeline = client.timeline(match_id)
                 except RiotAPIError as exc:
-                    console.print(Text(f"  {match_id}: {exc}", style="dim"))
+                    failures += 1
+                    log.debug("%s: %s", match_id, exc)
                     continue
 
                 match_path.write_text(json.dumps(match), encoding="utf-8")
                 timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
                 written += 1
                 status.update(
-                    f"harvested {written}/{args.count} matches "
-                    f"({client.request_count} requests, {client.cache_hits} cached)"
+                    f"harvested {written}/{target} matches  "
+                    f"({client.request_count} requests, {client.cache_hits} cached, "
+                    f"{failures} skipped)"
                 )
-
-                # Snowball through the other nine players so the sample is not
-                # ten thousand games from one person's account.
-                if args.crawl:
-                    for puuid_other in (match.get("metadata", {}) or {}).get("participants", []):
-                        if puuid_other not in seen_puuids:
-                            seen_puuids.add(puuid_other)
-                            frontier.append(puuid_other)
 
     console.print(
         f"\nwrote {written} match/timeline pairs to {out_dir} "
-        f"({client.request_count} API requests)"
+        f"({client.request_count} API requests, {failures} skipped)"
     )
     console.print(Text(f"next: rift-oracle train --data {out_dir}", style="dim"))
     return 0
+
+
+#: A spread across the tiers most EUW ranked games are actually played in.
+#: Seeding only from challenger would train the model on a population whose
+#: games look nothing like the ones it will be asked about.
+LADDER_SPREAD = [
+    ("BRONZE", "II"), ("SILVER", "II"), ("GOLD", "II"), ("GOLD", "IV"),
+    ("PLATINUM", "II"), ("PLATINUM", "IV"), ("EMERALD", "II"), ("EMERALD", "IV"),
+    ("DIAMOND", "II"), ("DIAMOND", "IV"), ("MASTER", "I"),
+]
+
+
+def _seed_players(client, args: argparse.Namespace, console: Console) -> List[str]:
+    """Collect seed puuids from explicit Riot IDs and from ladder tiers."""
+    from rift_oracle.riot.client import RiotAPIError
+
+    seeds: List[str] = []
+    seen: set = set()
+
+    for riot_id in args.riot_id:
+        try:
+            account = client.resolve_riot_id(riot_id)
+        except RiftOracleError as exc:
+            console.print(Text(f"  {riot_id}: {exc}", style="yellow"))
+            continue
+        if account["puuid"] not in seen:
+            seen.add(account["puuid"])
+            seeds.append(account["puuid"])
+            console.print(f"  seed {riot_id}")
+
+    tiers: List[Tuple[str, str]] = []
+    if args.ladder:
+        tiers.extend(LADDER_SPREAD)
+    for spec in args.tier:
+        tier, _, division = spec.partition(":")
+        tiers.append((tier.upper(), (division or "I").upper()))
+
+    for tier, division in tiers:
+        try:
+            entries = client.league_entries_by_tier(
+                tier, division, page=args.page, platform=settings_platform(client)
+            )
+        except RiotAPIError as exc:
+            console.print(Text(f"  {tier} {division}: {exc}", style="yellow"))
+            continue
+        added = 0
+        for entry in entries[: args.per_tier]:
+            puuid = entry.get("puuid")
+            if puuid and puuid not in seen:
+                seen.add(puuid)
+                seeds.append(puuid)
+                added += 1
+        console.print(f"  seed {tier} {division}: {added} players")
+
+    return seeds
+
+
+def settings_platform(client) -> str:
+    return client.platform
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
@@ -906,7 +964,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from rift_oracle.riot.client import RiotAPIError, RiotClient
     from rift_oracle.riot.ddragon import default_ddragon
     from rift_oracle.riot.live_client import LiveClient
-    from rift_oracle.riot.routing import platform_host, regional_host
+    from rift_oracle.riot.routing import platform_host, regional_host, regional_route
 
     console = _console(args)
     settings = _settings(args)
@@ -931,14 +989,50 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if settings.api_key:
         client = RiotClient(settings)
+        # Probe with champion-rotations, not spectator's featured-games: that
+        # endpoint is not granted to development keys, so a health check built
+        # on it reports a perfectly good key as rejected.
         try:
-            client.featured_games()
-            line("Riot API reachable", True, "spectator-v5 answered")
+            client.champion_rotations()
+            line(f"platform API ({settings.platform})", True, "champion-rotations answered")
         except RiotAPIError as exc:
-            hint = "development keys expire after 24h" if exc.status == 403 else ""
-            line("Riot API reachable", False, f"{exc} {hint}")
+            hint = " (development keys expire after 24h)" if exc.status == 403 else ""
+            line(f"platform API ({settings.platform})", False, f"{exc}{hint}")
         except RiftOracleError as exc:
-            line("Riot API reachable", False, str(exc))
+            line(f"platform API ({settings.platform})", False, str(exc))
+
+        # The regional host is a separate routing value with its own limits and
+        # its own grants, so it needs its own probe.
+        region = regional_route(settings.platform)
+        if args.riot_id:
+            try:
+                account = client.resolve_riot_id(args.riot_id)
+                puuid = account["puuid"]
+                line(
+                    f"regional API ({region})", True,
+                    f"{account.get('gameName')}#{account.get('tagLine')} resolved",
+                )
+                ids = client.match_ids(puuid, count=1, queue=420)
+                line(
+                    "ranked match history", True,
+                    f"most recent solo-queue game: {ids[0]}" if ids
+                    else "no ranked solo games on this account",
+                )
+                if ids:
+                    client.timeline(ids[0])
+                    line("match timeline", True, "downloadable, so replay will work")
+                game = client.active_game(puuid)
+                line(
+                    "spectator", True,
+                    f"in game {game.get('gameId')} right now" if game else "not in a game",
+                )
+            except RiotAPIError as exc:
+                line(f"regional API ({region})", False, str(exc))
+        else:
+            line(
+                f"regional API ({region})", True,
+                "pass --riot-id 'Name#TAG' for an end-to-end check",
+            )
 
     ddragon = default_ddragon(settings.locale, offline=settings.offline)
     champions = ddragon.champions()
@@ -1105,14 +1199,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_harvest.add_argument("--api-key")
     p_harvest.add_argument("--platform")
     p_harvest.add_argument("--riot-id", action="append", default=[], help="seed player, repeatable")
+    p_harvest.add_argument(
+        "--tier", action="append", default=[],
+        help="seed from a ranked tier, e.g. --tier EMERALD:II (repeatable)",
+    )
+    p_harvest.add_argument(
+        "--ladder", action="store_true",
+        help="seed from a spread of tiers across the ladder",
+    )
+    p_harvest.add_argument("--per-tier", type=int, default=60, help="players per tier")
+    p_harvest.add_argument("--per-player", type=int, default=5, help="matches per player")
+    p_harvest.add_argument("--page", type=int, default=1, help="ranked-entries page")
     p_harvest.add_argument("--count", type=int, default=200, help="matches to fetch")
     p_harvest.add_argument("--queue", type=int, default=420, help="queue id, 0 for any")
     p_harvest.add_argument("--out", default="matches", help="output directory")
-    p_harvest.add_argument(
-        "--no-crawl", dest="crawl", action="store_false",
-        help="only use the seed players' own matches",
-    )
-    p_harvest.set_defaults(func=cmd_harvest, crawl=True)
+    p_harvest.add_argument("--seed", type=int, default=0, help="shuffle seed")
+    p_harvest.set_defaults(func=cmd_harvest)
 
     # backtest
     p_backtest = sub.add_parser("backtest", help="score the model and check calibration")
@@ -1133,7 +1235,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("--api-key")
     p_doctor.add_argument("--platform")
     p_doctor.add_argument("--model")
-    p_doctor.set_defaults(func=cmd_doctor)
+    p_doctor.add_argument(
+        "--riot-id", help="Name#TAG to check the account, history and spectator paths"
+    )
+    p_doctor.set_defaults(func=cmd_doctor, riot_id=None)
 
     # configure
     p_conf = sub.add_parser("configure", help="save the API key and default platform")

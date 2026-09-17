@@ -93,24 +93,26 @@ def _headline(swing: Swing, gainer: str, before: float, after: float, delta: flo
     """One line naming the swing and, when possible, its single cause."""
     movement = f"{percent(before)} -> {percent(after)}"
 
-    top_key = swing.attributions[0][0] if swing.attributions else None
-    if top_key:
-        causes = swing.causes_for(top_key)
-        if causes:
-            headline_event = max(causes, key=lambda event: event.importance)
-            return f"{headline_event.text}  ({movement}, {points(delta)} {gainer})"
+    # Rank by the same bundles the body reports, or the headline can credit
+    # one factor while the reasons underneath rank a different one first.
+    ranked = swing.top_attributions(limit=4)
+    top_key = ranked[0][0] if ranked else None
 
-    # Fall back to a second feature that does have a named cause, but only
-    # when it explains a real share of the move. Crediting the loudest event in
-    # the window regardless would headline an item purchase for a swing that
-    # was actually about turret plates.
-    for key, share in swing.top_attributions(limit=3)[1:]:
-        if abs(share) < swing.magnitude * 0.3:
-            break
-        causes = swing.causes_for(key)
-        if causes:
-            event = max(causes, key=lambda e: e.importance)
-            return f"{event.text}  ({movement}, {points(delta)} {gainer})"
+    # Headline from an event that actually moved the odds, choosing the most
+    # notable one among the factors that carried the swing. Ranking purely by
+    # contribution would headline a routine kill for the window in which a
+    # team claimed dragon soul, because three combat features sum to more than
+    # the soul feature alone. Requiring a real share of the move first is what
+    # stops the loudest event in the window taking credit for something else.
+    candidates = [
+        event
+        for key, share in ranked
+        if abs(share) >= swing.magnitude * 0.2
+        for event in swing.causes_for(key)
+    ]
+    if candidates:
+        best = max(candidates, key=lambda event: (event.importance, event.t))
+        return f"{best.text}  ({movement}, {points(delta)} {gainer})"
 
     if top_key:
         spec = SPEC_BY_KEY.get(top_key)

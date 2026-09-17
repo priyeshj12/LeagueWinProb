@@ -20,12 +20,15 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 APP_NAME = "rift_oracle"
 
 _KEY_ENV_VARS = ("RIOT_API_KEY", "RIOT_TOKEN", "RGAPI_KEY")
+#: Riot keys are ``RGAPI-`` plus a UUID, so this catches any well-formed one.
 _KEY_PATTERN = re.compile(r"RGAPI-[0-9a-fA-F-]{8,}")
+#: Keys seen at runtime, scrubbed verbatim whatever shape they happen to be.
+_KNOWN_SECRETS: Set[str] = set()
 
 
 def app_dir() -> Path:
@@ -66,9 +69,26 @@ def bundled_data_dir() -> Path:
     return Path(__file__).resolve().parent / "data"
 
 
+def remember_secret(value: Optional[str]) -> None:
+    """Register a key so :func:`redact` scrubs it verbatim from now on."""
+    if value and len(value.strip()) >= 8:
+        _KNOWN_SECRETS.add(value.strip())
+
+
 def redact(text: str) -> str:
-    """Strip anything that looks like a Riot API key out of ``text``."""
-    return _KEY_PATTERN.sub("RGAPI-<redacted>", text or "")
+    """Strip anything that looks like a Riot API key out of ``text``.
+
+    Two passes, because neither alone is enough. The pattern catches
+    well-formed keys in text this process never saw the key in - a traceback
+    from a library, say. Substituting the keys actually in use catches anything
+    the pattern misses, including a malformed or truncated key that would
+    otherwise sail through into a log line or a bug report.
+    """
+    if not text:
+        return text or ""
+    for secret in _KNOWN_SECRETS:
+        text = text.replace(secret, "RGAPI-<redacted>")
+    return _KEY_PATTERN.sub("RGAPI-<redacted>", text)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -146,6 +166,7 @@ class Settings:
                 setattr(settings, key, stored[key])
 
         settings.api_key = _discover_key()
+        remember_secret(settings.api_key)
 
         env_platform = os.environ.get("RIOT_PLATFORM") or os.environ.get("RIFT_ORACLE_PLATFORM")
         if env_platform:
@@ -156,6 +177,8 @@ class Settings:
                 continue
             if hasattr(settings, key):
                 setattr(settings, key, value)
+                if key == "api_key":
+                    remember_secret(value)
             else:
                 settings.extra[key] = value
 

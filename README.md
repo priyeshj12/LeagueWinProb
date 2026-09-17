@@ -39,8 +39,12 @@ Set your Riot API key once (keys come from https://developer.riotgames.com/):
 
 ```bash
 export RIOT_API_KEY=RGAPI-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-# or: rift-oracle configure --api-key RGAPI-... --platform na1
+# or: rift-oracle configure --api-key RGAPI-... --platform euw1
 ```
+
+`rift-oracle doctor --riot-id "You#TAG"` checks the whole chain end to end:
+the key, both routing values, your ranked history, timeline access, and
+spectator.
 
 Then:
 
@@ -210,17 +214,25 @@ not determine outcomes.
 To fit on real matches instead:
 
 ```bash
-rift-oracle harvest --riot-id "You#TAG" --count 500   # snowballs through opponents
+rift-oracle harvest --ladder --count 800      # seeds across the whole ladder
 rift-oracle train --data matches
 rift-oracle backtest --data matches --live-mask
 ```
 
-`harvest` crawls outward from the seed players so the sample is not five hundred
-games from one account. `train` splits by *game*, never by frame — consecutive
-states from one match share a winner and most of their features, and a random
-row split would report flattering nonsense. Every game enters training twice,
-once with everything observed and once masked down to what `live` can see, so
-the model is honest under both.
+`--ladder` seeds from `league-v4` across Bronze through Master, a spread chosen
+because a model trained only on Challenger games would be asked about games
+that look nothing like them. `--tier EMERALD:II` picks specific rungs and
+`--riot-id` seeds from named accounts; they combine. Matches already on disk
+are skipped, so an interrupted harvest resumes.
+
+Throughput is capped by Riot's limits, not by the tool: at two requests per
+match against a 100-per-2-minutes budget, expect roughly 25 matches a minute.
+
+`train` splits by *game*, never by frame — consecutive states from one match
+share a winner and most of their features, and a random row split would report
+flattering nonsense. Every game enters training twice, once with everything
+observed and once masked down to what `live` can see, so the model is honest
+under both.
 
 `backtest` reports a reliability table and how much an isotonic recalibration
 would buy. On a well-fit model the answer is approximately nothing, which is
@@ -262,6 +274,10 @@ Useful flags: `--threshold 0.03` to catch smaller swings, `--window 120` to let
 a swing span longer, `--html` and `--json-out` to write reports, `--compact`
 for one-line output, `--platform euw1` for a region other than NA.
 
+Riot enforces its limits **per routing value**, so the client keeps a separate
+limiter per host: resolving accounts and fetching ranks on `euw1` does not
+spend the budget that match downloads need on `europe`.
+
 ---
 
 ## Limitations
@@ -272,6 +288,9 @@ for one-line output, `--platform euw1` for a region other than NA.
 - Live-mode team gold is estimated, typically within a few hundred per team.
 - `watch` cannot see live gold or kills, because Riot does not expose them.
 - Development API keys expire every 24 hours. `doctor` tells you when yours has.
+- `spectator-v5/featured-games` is not granted to development keys. `doctor`
+  probes `champion-rotations` instead, because a health check built on
+  `featured-games` reports a perfectly good key as rejected.
 - Summoner's Rift 5v5 only. ARAM and Arena have different dynamics and are not
   modelled.
 - Not affiliated with or endorsed by Riot Games.
@@ -280,7 +299,7 @@ for one-line output, `--platform euw1` for a region other than NA.
 
 ```bash
 pip install -e .[dev]
-pytest                      # 98 tests
+pytest                      # 120 tests
 python -m pyflakes rift_oracle tests
 ```
 
@@ -290,6 +309,10 @@ residual, that every feature response is non-decreasing, that the advice engine
 is symmetric between sides, and that the Riot payload semantics that are easy
 to get backwards (`BUILDING_KILL.teamId` is the team that *lost* the building;
 `ORDER` is blue) are right.
+
+The client tests run against a fake session, so they never touch the network,
+and the whole suite runs against a throwaway state directory so it can neither
+read your API key nor be fooled by a previous run's cached responses.
 
 ## License
 

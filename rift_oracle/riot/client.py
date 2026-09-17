@@ -1,8 +1,12 @@
 """Riot Web API client: rate limiting, retries, and an on-disk cache.
 
-Development keys are limited to 20 requests/second and 100 requests/2 minutes.
-:class:`RateLimiter` enforces both windows locally so the client rarely sees a
-429 at all, and when it does it honours ``Retry-After`` rather than guessing.
+Development keys are limited to 20 requests/second and 100 requests/2 minutes,
+and those budgets are enforced **per routing value** - ``euw1`` and ``europe``
+each get their own. So does this client: it keeps one :class:`RateLimiter` per
+host, which means resolving accounts and fetching ranks does not spend the
+budget that match downloads need. Both windows are enforced locally, so the
+client rarely sees a 429 at all, and when it does it honours ``Retry-After``
+rather than guessing.
 
 Match and timeline payloads are immutable once a game ends, so they are cached
 on disk forever; everything else uses a short TTL or no cache at all.
@@ -61,20 +65,27 @@ class RiotAPIError(RiftOracleError):
 
 
 class RateLimiter:
-    """Sliding-window limiter covering several (count, seconds) buckets."""
+    """Sliding-window limiter covering several (count, seconds) buckets.
+
+    A server-imposed pause is tracked as its own deadline rather than by
+    stuffing the windows with synthetic timestamps. Filling the windows would
+    make a one-second ``Retry-After`` block for the length of the *longest*
+    window, so a single 429 would stall the client for two minutes.
+    """
 
     def __init__(self, limits: Sequence[Tuple[int, float]] = ((20, 1.0), (100, 120.0))) -> None:
         self._limits: List[Tuple[int, float, Deque[float]]] = [
             (count, window, deque()) for count, window in limits
         ]
         self._lock = threading.Lock()
+        self._blocked_until = 0.0
 
     def acquire(self) -> None:
         """Block until a request may be issued, then record it."""
         while True:
             with self._lock:
                 now = time.monotonic()
-                wait = 0.0
+                wait = max(0.0, self._blocked_until - now)
                 for count, window, stamps in self._limits:
                     while stamps and now - stamps[0] >= window:
                         stamps.popleft()
@@ -87,12 +98,11 @@ class RateLimiter:
             time.sleep(min(wait, 5.0))
 
     def penalise(self, seconds: float) -> None:
-        """Record a server-imposed pause so concurrent callers also back off."""
-        deadline = time.monotonic() + max(seconds, 0.0)
+        """Hold off for ``seconds``, as the server asked."""
         with self._lock:
-            for count, _window, stamps in self._limits:
-                while len(stamps) < count:
-                    stamps.append(deadline)
+            self._blocked_until = max(
+                self._blocked_until, time.monotonic() + max(seconds, 0.0)
+            )
 
 
 class DiskCache:
@@ -161,10 +171,15 @@ class RiotClient:
                 "User-Agent": "rift_oracle/1.0 (+https://github.com/priyeshj12/LeagueWinProb)",
             }
         )
-        self.limiter = RateLimiter()
+        # One limiter per routing value, created on first use.
+        self._limiters: Dict[str, RateLimiter] = {}
         self.cache = DiskCache(ttl_s=settings.cache_ttl_s)
         self.request_count = 0
         self.cache_hits = 0
+
+    def limiter_for(self, url: str) -> RateLimiter:
+        """The limiter guarding the routing value this URL belongs to."""
+        return self._limiters.setdefault(routing_value(url), RateLimiter())
 
     # -- plumbing ---------------------------------------------------------
 
@@ -196,9 +211,10 @@ class RiotClient:
 
         backoff = 1.0
         last_error: Optional[RiotAPIError] = None
+        limiter = self.limiter_for(url)
 
         for attempt in range(self.settings.max_retries + 1):
-            self.limiter.acquire()
+            limiter.acquire()
             self.request_count += 1
             try:
                 response = self.session.get(
@@ -224,7 +240,7 @@ class RiotClient:
                 retry_after = _retry_after(response, default=backoff)
                 last_error = RiotAPIError(response.status_code, url, response.text)
                 if response.status_code == 429:
-                    self.limiter.penalise(retry_after)
+                    limiter.penalise(retry_after)
                     log.warning(
                         "rate limited (%s); sleeping %.1fs",
                         response.headers.get("X-Rate-Limit-Type", "unknown"),
@@ -283,6 +299,42 @@ class RiotClient:
                 return []
             raise
         return payload or []
+
+    APEX_TIERS = ("CHALLENGER", "GRANDMASTER", "MASTER")
+
+    def league_entries_by_tier(
+        self,
+        tier: str,
+        division: str = "I",
+        queue: str = "RANKED_SOLO_5x5",
+        page: int = 1,
+        platform: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """A page of ranked entries at one tier and division.
+
+        The apex tiers live behind their own endpoints and have no divisions,
+        so they are routed differently and unwrapped to the same shape.
+        """
+        host = platform_host(platform or self.platform)
+        tier = tier.upper()
+
+        if tier in self.APEX_TIERS:
+            url = f"{host}/lol/league/v4/{tier.lower()}leagues/by-queue/{_esc(queue)}"
+            payload = self.get(url, cache=True) or {}
+            return list(payload.get("entries") or [])
+
+        url = f"{host}/lol/league/v4/entries/{_esc(queue)}/{tier}/{_esc(division.upper())}"
+        return self.get(url, params={"page": max(1, int(page))}, cache=True) or []
+
+    def champion_rotations(self, platform: Optional[str] = None) -> Dict[str, Any]:
+        """A parameterless call every key can make, used as a reachability probe.
+
+        ``spectator-v5/featured-games`` would be the obvious probe but is not
+        granted to development keys, so a health check built on it reports a
+        working key as broken.
+        """
+        host = platform_host(platform or self.platform)
+        return self.get(f"{host}/lol/platform/v3/champion-rotations")
 
     # -- spectator-v5 -----------------------------------------------------
 
@@ -358,6 +410,14 @@ def _retry_after(response: requests.Response, default: float) -> float:
         except ValueError:
             pass
     return max(default, 1.0)
+
+
+def routing_value(url: str) -> str:
+    """The routing value a Riot URL belongs to (``euw1``, ``europe``, ...)."""
+    from urllib.parse import urlparse
+
+    host = urlparse(url).netloc
+    return host.split(".", 1)[0].lower() if host else "unknown"
 
 
 def _esc(value: str) -> str:
