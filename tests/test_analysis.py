@@ -251,3 +251,19 @@ def test_a_headline_falls_back_when_no_event_matches_the_direction():
     headline = narrate_swing(swing).headline
     assert "Blue took" not in headline
     assert "Red" in headline  # describes the drift instead of miscrediting
+    assert "Turret lead" in headline  # the display name, never the internal key
+
+
+def test_a_fallback_headline_uses_the_bundle_display_name():
+    """The raw key would surface as "Economy moved toward Blue"."""
+    from rift_oracle.analysis.narrate import narrate_swing
+    from rift_oracle.analysis.swings import Swing
+
+    swing = Swing(
+        start_t=120.0, end_t=180.0, p_before=0.32, p_after=0.43,
+        attributions=[("gold_share", 0.07), ("gold_diff_k", 0.04)],
+        events=[],
+    )
+    headline = narrate_swing(swing).headline
+    assert headline.startswith("Gold lead")
+    assert "economy" not in headline.lower()

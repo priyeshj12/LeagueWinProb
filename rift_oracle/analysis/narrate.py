@@ -27,7 +27,7 @@ from rift_oracle.analysis.swings import (
 )
 from rift_oracle.game.scaling import biggest_scalers, crossover_minute
 from rift_oracle.game.state import BLUE, RED, GameEvent, GameState
-from rift_oracle.model.features import SPEC_BY_KEY, display_value
+from rift_oracle.model.features import display_value
 
 
 @dataclass
@@ -120,10 +120,11 @@ def _headline(swing: Swing, gainer: str, before: float, after: float, delta: flo
         return f"{best.text}  ({movement}, {points(delta)} {gainer})"
 
     if top_key:
-        spec = SPEC_BY_KEY.get(top_key)
-        label = spec.noun if spec else top_key
+        # bundle_label, not the raw key: the bundles have display names and the
+        # internal key would surface as "Economy moved toward Blue".
+        label = bundle_label(top_key)
         verb = "drifted" if swing.kind == "drift" else "moved"
-        return f"{label.capitalize()} {verb} toward {gainer}  ({movement}, {points(delta)})"
+        return f"{label[:1].upper()}{label[1:]} {verb} toward {gainer}  ({movement}, {points(delta)})"
 
     if swing.kind == "drift":
         return f"Slow drift to {gainer}  ({movement}, {points(delta)})"
