@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.spec.bak
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# rift_oracle local state
+.cache/
+runs/
+*.oracle.json
+*.oracle.html
+riotgames.pem
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
