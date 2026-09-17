@@ -207,11 +207,11 @@ Held out on 1,200 unseen simulated games:
 
 | metric | value |
 |---|---|
-| log loss | 0.506 |
-| Brier | 0.170 |
-| AUC | 0.826 |
-| accuracy | 73.9% |
-| expected calibration error | 1.2% |
+| log loss | 0.499 |
+| Brier | 0.168 |
+| AUC | 0.831 |
+| accuracy | 74.1% |
+| expected calibration error | 1.6% |
 
 Accuracy by game clock runs 64% in the first ten minutes to 85% after thirty,
 which is the shape a real win-probability model has: early states genuinely do
@@ -223,6 +223,13 @@ real matches against eighty-five parameters need far more than several thousand
 simulated games do. Above a few hundred games the search runs on a subsample
 and scales the result by the size ratio, which keeps the effective prior fixed
 rather than the penalty.
+
+The penalty is applied in proportion to each column's spread, which is the
+same as standardising the design and penalising uniformly. Plain ridge
+penalises raw coefficients, and these columns differ by orders of magnitude —
+a gold lead runs to tens of thousands of units while composition scaling lives
+inside ±0.6 — so uniform shrinkage deletes the informative small-scale features
+first.
 
 To fit on real matches instead:
 

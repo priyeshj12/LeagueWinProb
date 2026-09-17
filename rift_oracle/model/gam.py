@@ -363,7 +363,20 @@ class AdditiveWinModel:
 
         n_params = flat.shape[1]
         beta = np.zeros(n_params, dtype=np.float64)
-        penalty = np.full(n_params, float(l2), dtype=np.float64)
+
+        # Penalise each coefficient in proportion to its column's spread, which
+        # is the same as standardising the design and penalising uniformly.
+        # Plain ridge penalises raw coefficients, and these columns differ by
+        # orders of magnitude: a gold lead runs to tens of thousands of units
+        # while composition scaling lives inside +/-0.6. To contribute the same
+        # logit, the small-scale feature needs a coefficient ~50x larger, which
+        # plain ridge punishes ~2500x harder - so heavy shrinkage silently
+        # deletes the informative small-scale features first. That is exactly
+        # what happened: a cross-validated penalty improved calibration while
+        # flattening the draft projection to nothing.
+        column_scale = flat.std(axis=0)
+        column_scale[column_scale <= 1e-12] = 1.0
+        penalty = float(l2) * column_scale**2
         if fit_side_bias:
             # The side bias is a single real effect; do not shrink it much.
             penalty[-1] = 1e-3
