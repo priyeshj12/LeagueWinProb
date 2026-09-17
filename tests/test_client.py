@@ -174,12 +174,15 @@ def test_network_errors_are_retried_then_reported_without_the_key():
     """A key must never reach a log line, whatever shape it is."""
     from rift_oracle.config import remember_secret
 
-    real_key = "RGAPI-7261588f-bc92-4970-a765-bdeef90457bf"
+    # A well-formed key (RGAPI- plus a UUID) and one the pattern cannot match.
+    # Never put a live key here: this file is committed, and a secret in a test
+    # fixture is a secret in the repository's history.
+    well_formed = "RGAPI-00000000-1111-2222-3333-444444444444"
     malformed = "RGAPI-not-a-uuid-at-all"
-    remember_secret(real_key)
+    remember_secret(well_formed)
     remember_secret(malformed)
 
-    for secret in (real_key, malformed):
+    for secret in (well_formed, malformed):
         client = _client(
             [requests.ConnectionError(f"dial tcp failed for {secret}")] * 3, max_retries=1
         )
