@@ -1,0 +1,226 @@
+name: harvest
+
+# Keeps the shipped model tracking the live patch.
+#
+# Deliberately weekly and modest. The held-out learning curve on real games
+# flattens somewhere around 400-800 matches, so the reason to keep collecting
+# is freshness, not volume - a year of accumulated games would average over
+# several metas rather than describe the current one. Shards older than
+# KEEP_WEEKS are dropped for the same reason.
+#
+# Two things to know before relying on this:
+#
+#   * A development key deactivates every 24 hours, so a scheduled run using
+#     one works once and then fails daily. Register a personal key (Riot
+#     issues them for personal projects and research at the same rate limits)
+#     and store it as the RIOT_API_KEY secret.
+#   * GitHub disables scheduled workflows on a repository with no activity for
+#     60 days. This one commits on most runs, which keeps itself alive, but a
+#     long quiet period will still need a manual re-enable.
+
+on:
+  schedule:
+    # Mondays, 05:23 UTC. Off the hour on purpose: scheduled workflows queue
+    # heavily at :00 and GitHub drops runs it cannot start on time.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Matches to harvest per region"
+        default: "600"
+      min_gain:
+        description: "Log-loss improvement required to replace the shipped model"
+        default: "0.002"
+
+permissions:
+  contents: write
+
+# One harvest at a time. Two concurrent runs each believe they own the whole
+# rate-limit budget, and spend themselves trading 429s instead of collecting.
+concurrency:
+  group: harvest
+  cancel-in-progress: false
+
+env:
+  KEEP_WEEKS: "16"
+  DEFAULT_COUNT: "600"
+  DEFAULT_MIN_GAIN: "0.002"
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Riot enforces its limits per routing value, and these three platforms
+      # map to different ones (europe, americas, asia). Running them together
+      # is real parallelism, not a way around the limit.
+      matrix:
+        region: [euw1, na1, kr]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Check the key before spending an hour on it
+        # Non-fatal, but it puts the real reason at the top of the log instead
+        # of forty minutes of 401s further down.
+        continue-on-error: true
+        env:
+          RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+        run: rift-oracle doctor --platform ${{ matrix.region }}
+
+      - name: Harvest ${{ matrix.region }}
+        env:
+          RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+        run: |
+          COUNT="${{ github.event.inputs.count || env.DEFAULT_COUNT }}"
+          STAMP="$(date -u +%Y-%m-%d)"
+          mkdir -p shards
+          # --features-out reduces each game to feature rows as it arrives and
+          # drops the JSON: about 1 MB per thousand games instead of 900 MB.
+          rift-oracle harvest \
+            --platform "${{ matrix.region }}" \
+            --ladder --per-tier 120 --per-player 4 \
+            --count "$COUNT" --queue 420 \
+            --features-out "shards/${STAMP}-${{ matrix.region }}.npz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.region }}
+          path: shards/*.npz
+          if-no-files-found: error
+          retention-days: 7
+
+  retrain:
+    needs: harvest
+    # Run even if a region failed: two good shards are still worth folding in.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+          pattern: shard-*
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Fold in the new shards
+        id: shards
+        run: |
+          mkdir -p data/features
+          added=0
+          if compgen -G "incoming/*.npz" > /dev/null; then
+            for shard in incoming/*.npz; do
+              cp "$shard" data/features/
+              added=$((added + 1))
+            done
+          fi
+          echo "added=$added" >> "$GITHUB_OUTPUT"
+
+          # Drop shards past the retention window. They are named
+          # YYYY-MM-DD-<region>.npz, so a date comparison on the filename is
+          # enough and needs no metadata read.
+          cutoff="$(date -u -d "${KEEP_WEEKS} weeks ago" +%Y-%m-%d)"
+          pruned=0
+          for shard in data/features/*.npz; do
+            [ -e "$shard" ] || continue
+            stamp="$(basename "$shard" | cut -c1-10)"
+            if [[ "$stamp" < "$cutoff" ]]; then
+              rm "$shard"
+              pruned=$((pruned + 1))
+            fi
+          done
+          echo "pruned=$pruned" >> "$GITHUB_OUTPUT"
+          echo "Added $added shard(s), pruned $pruned older than $cutoff."
+          du -sh data/features || true
+
+      - name: Retrain, and keep the old model unless this one is better
+        id: retrain
+        if: steps.shards.outputs.added != '0'
+        run: |
+          MIN_GAIN="${{ github.event.inputs.min_gain || env.DEFAULT_MIN_GAIN }}"
+          set +e
+          rift-oracle train \
+            --features data/features \
+            --compare-to rift_oracle/data/baseline_model.json \
+            --min-gain "$MIN_GAIN" \
+            --out rift_oracle/data/baseline_model.json \
+            --report rift_oracle/data/baseline_report.json
+          code=$?
+          set -e
+          # 3 means the candidate did not beat the shipped model. That is a
+          # normal outcome for a weekly refit, not a failure.
+          case "$code" in
+            0) echo "model=updated" >> "$GITHUB_OUTPUT" ;;
+            3) echo "model=kept" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+
+      - name: Test against the model that is about to be committed
+        if: steps.retrain.outputs.model == 'updated'
+        run: |
+          python -m pip install pytest
+          python -m pytest -q
+
+      - name: Count what we have
+        id: totals
+        if: steps.shards.outputs.added != '0'
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from pathlib import Path
+          from rift_oracle.model.train import Dataset
+          data = Dataset.load_shards(Path("data/features"))
+          shards = len(list(Path("data/features").glob("*.npz")))
+          print(f"games={data.n_games}")
+          print(f"states={len(data)}")
+          print(f"shards={shards}")
+          PY
+
+      - name: Commit
+        if: steps.shards.outputs.added != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/features rift_oracle/data/baseline_model.json rift_oracle/data/baseline_report.json
+          if git diff --cached --quiet; then
+            echo "Nothing changed."
+            exit 0
+          fi
+          git commit -F - <<COMMIT
+          Weekly harvest: ${{ steps.totals.outputs.games }} games across ${{ steps.totals.outputs.shards }} shards
+
+          ${{ steps.shards.outputs.added }} new shard(s), ${{ steps.shards.outputs.pruned }} pruned
+          past the ${{ env.KEEP_WEEKS }}-week window. Model: ${{ steps.retrain.outputs.model || 'unchanged' }}.
+
+          The shards hold ${{ steps.totals.outputs.states }} evaluated states. The raw match and
+          timeline JSON they came from is not kept: it runs to roughly 900 MB per
+          thousand games, against about 1 MB for the features the model reads.
+          COMMIT
+          # Rebase rather than force: a person may well have pushed since.
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin HEAD:"${{ github.ref_name }}"

@@ -49,7 +49,10 @@ class RiotAPIError(RiftOracleError):
     def _describe(self) -> str:
         hints = {
             400: "bad request - check the puuid / match id you passed",
-            401: "no API key was sent",
+            401: "the key was missing or rejected - development keys deactivate "
+            "every 24 hours, so a key that worked yesterday will not today "
+            "(regenerate at https://developer.riotgames.com/, or register a "
+            "personal key, which does not expire daily)",
             403: "key rejected: it is expired, revoked, or lacks this endpoint "
             "(development keys expire every 24h - regenerate at "
             "https://developer.riotgames.com/)",

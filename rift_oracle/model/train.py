@@ -35,9 +35,21 @@ from rift_oracle.model.gam import AdditiveWinModel
 log = logging.getLogger(__name__)
 
 
+#: Bumped whenever the on-disk shard layout changes incompatibly.
+DATASET_FORMAT = "rift_oracle.dataset.v1"
+
+
 @dataclass
 class Dataset:
-    """Stacked feature arrays plus the game each row came from."""
+    """Stacked feature arrays plus the game each row came from.
+
+    Shards of this are what a scheduled harvest accumulates. Raw match and
+    timeline JSON runs to about 900 MB per thousand games - almost all of it
+    timelines - which is a non-starter for anything that keeps history. The
+    features those games reduce to are 1.1 MB per thousand, eight hundred times
+    smaller, and they are all the model ever sees. So the pipeline extracts on
+    the way past and keeps only the arrays.
+    """
 
     values: np.ndarray
     masks: np.ndarray
@@ -47,6 +59,99 @@ class Dataset:
 
     def __len__(self) -> int:
         return int(self.values.shape[0])
+
+    # -- persistence -------------------------------------------------------
+
+    def save_npz(self, path: Path, meta: Optional[Dict[str, Any]] = None) -> Path:
+        """Write a compressed shard.
+
+        float32 is far past the precision any of these features carry, and the
+        masks are one bit each, so both are narrowed on the way out. The
+        feature list is stored alongside: a shard built from a different set of
+        features is not loadable, and silently mixing them would be worse than
+        refusing.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path,
+            values=self.values.astype(np.float32),
+            masks=np.packbits(self.masks.astype(bool), axis=1),
+            n_features=np.array([self.values.shape[1]], dtype=np.int32),
+            times=self.times.astype(np.float32),
+            labels=self.labels.astype(np.uint8),
+            groups=self.groups.astype(np.int64),
+            feature_keys=np.array(list(FEATURE_KEYS)),
+            fmt=np.array([DATASET_FORMAT]),
+            meta=np.array([json.dumps(meta or {})]),
+        )
+        return path
+
+    @classmethod
+    def load_npz(cls, path: Path) -> "Dataset":
+        path = Path(path)
+        with np.load(path, allow_pickle=False) as payload:
+            fmt = str(payload["fmt"][0]) if "fmt" in payload else "unknown"
+            if fmt != DATASET_FORMAT:
+                raise RiftOracleError(
+                    f"{path.name} is in format {fmt!r}, this build reads "
+                    f"{DATASET_FORMAT!r}. Re-extract it from the raw matches."
+                )
+            stored = [str(k) for k in payload["feature_keys"]]
+            if stored != list(FEATURE_KEYS):
+                missing = set(FEATURE_KEYS) ^ set(stored)
+                raise RiftOracleError(
+                    f"{path.name} was built with a different feature set "
+                    f"({len(stored)} features, differing on: "
+                    f"{', '.join(sorted(missing)) or 'ordering'}). Re-extract it."
+                )
+            n_features = int(payload["n_features"][0])
+            return cls(
+                values=payload["values"].astype(np.float64),
+                masks=np.unpackbits(
+                    payload["masks"], axis=1, count=n_features
+                ).astype(np.float64),
+                times=payload["times"].astype(np.float64),
+                labels=payload["labels"].astype(np.float64),
+                groups=payload["groups"].astype(np.int64),
+            )
+
+    @classmethod
+    def concat(cls, parts: Sequence["Dataset"]) -> "Dataset":
+        """Join shards, renumbering games so ids from different shards cannot collide.
+
+        Two shards harvested on different days both number their games from
+        zero. Concatenating without renumbering would merge unrelated games,
+        and every split that promises to hold out whole games would quietly
+        leak across the boundary.
+        """
+        usable = [part for part in parts if len(part)]
+        if not usable:
+            raise RiftOracleError("no usable feature shards")
+
+        groups: List[np.ndarray] = []
+        offset = 0
+        for part in usable:
+            renumbered = np.unique(part.groups, return_inverse=True)[1] + offset
+            groups.append(renumbered)
+            offset = int(renumbered.max()) + 1
+
+        return cls(
+            values=np.vstack([p.values for p in usable]),
+            masks=np.vstack([p.masks for p in usable]),
+            times=np.concatenate([p.times for p in usable]),
+            labels=np.concatenate([p.labels for p in usable]),
+            groups=np.concatenate(groups),
+        )
+
+    @classmethod
+    def load_shards(cls, path: Path) -> "Dataset":
+        """Load one shard, or every shard in a directory."""
+        path = Path(path)
+        shards = sorted(path.glob("*.npz")) if path.is_dir() else [path]
+        if not shards:
+            raise RiftOracleError(f"no .npz feature shards found in {path}")
+        return cls.concat([cls.load_npz(shard) for shard in shards])
 
     @property
     def n_games(self) -> int:
@@ -434,6 +539,62 @@ def train_from_directory(
         }
     )
     return model, report
+
+
+def train_from_shards(
+    path: Path,
+    l2: Optional[float] = None,
+    seed: int = 0,
+    verbose: bool = False,
+) -> Tuple[AdditiveWinModel, Dict[str, Any]]:
+    """Fit on accumulated feature shards."""
+    dataset = Dataset.load_shards(Path(path))
+    model, report = train_model(
+        dataset, l2=l2, seed=seed, refit_on_all=True, verbose=verbose
+    )
+    model.meta.update(
+        {
+            "trained_on": "riot-matches",
+            "n_games": dataset.n_games,
+            "n_states": len(dataset),
+            "l2": report.get("l2"),
+            "monotone": True,
+        }
+    )
+    return model, report
+
+
+def compare_on_holdout(
+    dataset: Dataset,
+    candidate: AdditiveWinModel,
+    incumbent: AdditiveWinModel,
+    seed: int = 0,
+    test_fraction: float = 0.2,
+) -> Dict[str, Any]:
+    """Score a new model against the current one on the same held-out games.
+
+    An unattended retrain needs a reason to replace what is already shipped.
+    Comparing both on one held-out split is that reason - and it has to be the
+    *same* split, because held-out log loss moves by more between two random
+    splits of a few hundred games than a real improvement usually does.
+    """
+    _train, test = dataset.split_by_game(test_fraction=test_fraction, seed=seed)
+    if not len(test):
+        return {"comparable": False}
+
+    scores = {}
+    for name, model in (("candidate", candidate), ("incumbent", incumbent)):
+        p = model.predict_proba(test.values, test.masks, test.times)
+        scores[name] = calibrate.metrics(test.labels, p)
+
+    delta = scores["incumbent"]["log_loss"] - scores["candidate"]["log_loss"]
+    return {
+        "comparable": True,
+        "test_games": test.n_games,
+        "candidate": scores["candidate"],
+        "incumbent": scores["incumbent"],
+        "log_loss_gain": float(delta),
+    }
 
 
 def format_report(report: Dict[str, Any]) -> str:

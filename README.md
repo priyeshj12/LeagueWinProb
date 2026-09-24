@@ -287,6 +287,66 @@ flattering nonsense. Every game enters training twice, once with everything
 observed and once masked down to what `live` can see, so the model is honest
 under both.
 
+### Keeping it fresh, unattended
+
+`.github/workflows/harvest.yml` runs weekly: it harvests across three regions
+in parallel, folds the result into the committed feature shards, retrains, and
+commits the model only if it beat the existing one on the same held-out games.
+Set one secret, `RIOT_API_KEY`, and it runs itself.
+
+Four things shaped that design.
+
+**It ships features, not matches.** Raw match and timeline JSON is about
+**900 MB per thousand games** — almost all of it timelines. The features those
+games reduce to are **1.1 MB per thousand**, eight hundred times smaller, and
+they are everything the model ever reads. So `harvest --features-out` replays
+each game the moment it arrives and keeps only the arrays. The 1,766 games in
+`data/features/` occupy 2 MB where their JSON was 1.6 GB.
+
+A useful side effect: the repo is trainable with no API key at all, because the
+features are committed even though the data they came from is not.
+
+```bash
+rift-oracle train --features data/features    # no key, no network
+```
+
+The shards also carry nothing that identifies anyone — feature *differences*, a
+clock, and a win bit, with no puuids, Riot IDs, match ids or champion names.
+That is a much smaller footprint than republishing API responses, but Riot's
+[Terms of Use](https://developer.riotgames.com/terms) is the authority on what
+you may publish, not this paragraph.
+
+**It collects for freshness, not volume.** The held-out learning curve flattens
+somewhere around 400–800 games, so scraping harder buys very little. What does
+change is the patch. The workflow keeps a rolling 16-week window and prunes
+older shards, so the model describes the current meta instead of averaging over
+a year of them.
+
+**A development key will not do.** Dev keys deactivate every 24 hours, so a
+scheduled run using one works once and then fails daily. Register a **personal
+key** — Riot issues them for personal projects and research at the same rate
+limits, without the daily expiry. `rift-oracle doctor` names this exact failure
+when it happens.
+
+**Two harvests at once are worse than one.** Concurrent runs each believe they
+own the whole rate-limit budget and spend themselves trading 429s, so the
+workflow takes a `concurrency` lock. The three regions in the matrix are safe
+to run together for the opposite reason: Riot enforces limits *per routing
+value*, and `euw1`, `na1` and `kr` map to `europe`, `americas` and `asia`.
+
+Actions minutes are free and unlimited on public repositories, so none of this
+costs anything. Two caveats worth knowing: GitHub disables scheduled workflows
+on a repository with no activity for 60 days (this one commits on most runs,
+which keeps it alive), and scheduled runs are queued rather than guaranteed —
+they can start late or be skipped at peak times, which is why the cron sits at
+`:23` rather than on the hour.
+
+A run that produces a worse model is a normal outcome, not a failure: `train
+--compare-to` scores the candidate and the incumbent on the *same* held-out
+split and exits 3 without saving if the candidate does not clear `--min-gain`.
+The same split matters — held-out log loss moves more between two random splits
+of a few hundred games than a real improvement usually does.
+
 `backtest` reports a reliability table and how much an isotonic recalibration
 would buy. On a well-fit model the answer is approximately nothing, which is
 the point.
@@ -321,8 +381,8 @@ CI builds it on every tag — see `.github/workflows/build-exe.yml`.
 | `watch RIOT_ID` | track a game in progress, then explain it when it ends |
 | `replay MATCH_ID` | replay a finished match and explain every swing |
 | `demo` | the whole pipeline on a simulated game (`--replay-speed 8` animates it) |
-| `train` | fit the model, simulated or `--data` real matches |
-| `harvest` | download match + timeline pairs |
+| `train` | fit the model: simulated, `--data` raw matches, or `--features` shards |
+| `harvest` | download matches; `--features-out` reduces them to shards as they arrive |
 | `backtest` | score the model and check its calibration |
 | `doctor` | check key, network, client and model |
 | `configure` | save the API key and default platform |
@@ -335,6 +395,11 @@ for one-line output, `--platform euw1` for a region other than NA.
 Riot enforces its limits **per routing value**, so the client keeps a separate
 limiter per host: resolving accounts and fetching ranks on `euw1` does not
 spend the budget that match downloads need on `europe`.
+
+For unattended runs: `harvest --features-out shard.npz` keeps the arrays and
+drops the JSON, `train --features <dir>` fits on accumulated shards, and
+`train --compare-to <model> --min-gain 0.002` exits 3 without saving when the
+new fit does not beat the old one.
 
 ---
 

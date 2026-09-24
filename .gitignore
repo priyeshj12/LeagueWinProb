@@ -16,6 +16,11 @@ htmlcov/
 # rift_oracle local state
 .cache/
 runs/
+# raw match JSON: ~900 MB per thousand games. Feature shards under
+# data/features are committed instead, at about 1 MB per thousand.
+matches/
+shards/
+incoming/
 *.oracle.json
 *.oracle.html
 riotgames.pem

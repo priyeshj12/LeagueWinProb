@@ -759,16 +759,30 @@ def _finish(
 def cmd_train(args: argparse.Namespace) -> int:
     from rift_oracle.model.registry import save_user_model
     from rift_oracle.model.train import (
+        Dataset,
+        compare_on_holdout,
         format_report,
         train_from_directory,
+        train_from_shards,
         train_synthetic,
     )
 
     console = _console(args)
 
     l2 = None if str(args.l2).lower() == "auto" else float(args.l2)
+    dataset = None
 
-    if args.data:
+    if args.features:
+        console.print(f"training on feature shards in {args.features}")
+        with console.status("loading shards..."):
+            dataset = Dataset.load_shards(Path(args.features))
+        console.print(
+            Text(f"  {dataset.n_games:,} games / {len(dataset):,} states", style="dim")
+        )
+        model, report = train_from_shards(
+            Path(args.features), l2=l2, seed=args.seed, verbose=args.verbose
+        )
+    elif args.data:
         console.print(f"training on real matches in {args.data}")
         with console.status("replaying timelines..."):
             model, report = train_from_directory(
@@ -791,6 +805,42 @@ def cmd_train(args: argparse.Namespace) -> int:
     for key, value in sorted(report["importance"].items(), key=lambda kv: -kv[1])[:10]:
         console.print(f"  {key:<20} {value:.4f}")
 
+    # An unattended retrain needs a reason to overwrite what is already shipped.
+    if args.compare_to:
+        from rift_oracle.model.gam import AdditiveWinModel
+
+        incumbent_path = Path(args.compare_to)
+        if not incumbent_path.is_file():
+            console.print(
+                Text(f"\nno model at {incumbent_path} to compare against; saving.", style="dim")
+            )
+        elif dataset is None:
+            console.print(
+                Text("\n--compare-to needs --features; skipping the comparison.", style="yellow")
+            )
+        else:
+            incumbent = AdditiveWinModel.load(incumbent_path)
+            verdict = compare_on_holdout(dataset, model, incumbent, seed=args.seed)
+            if verdict["comparable"]:
+                gain = verdict["log_loss_gain"]
+                console.print(
+                    f"\nagainst {incumbent_path.name} on {verdict['test_games']} held-out games: "
+                    f"log loss {verdict['incumbent']['log_loss']:.4f} -> "
+                    f"{verdict['candidate']['log_loss']:.4f} ({gain:+.4f})"
+                )
+                if gain < args.min_gain:
+                    console.print(
+                        Text(
+                            f"  not an improvement (needs {args.min_gain:+.4f}); "
+                            "keeping the existing model.",
+                            style="yellow",
+                        )
+                    )
+                    if args.report:
+                        report["comparison"] = verdict
+                        _write_json(Path(args.report), report, console)
+                    return 3
+
     if args.out:
         path = model.save(Path(args.out))
     else:
@@ -803,9 +853,16 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_harvest(args: argparse.Namespace) -> int:
-    """Download match + timeline pairs to train on."""
+    """Download match + timeline pairs, optionally reducing them as they arrive.
+
+    With ``--features-out`` each game is replayed and reduced to feature rows
+    the moment it lands, and the raw JSON is dropped unless ``--keep-raw`` asks
+    for it. That is the difference between 900 MB per thousand games and 1.1
+    MB, which is what makes an unattended, repeating harvest possible at all.
+    """
     import random
 
+    from rift_oracle.model.train import dataset_from_games
     from rift_oracle.riot.client import RiotAPIError, RiotClient
 
     console = _console(args)
@@ -813,8 +870,12 @@ def cmd_harvest(args: argparse.Namespace) -> int:
     settings.require_key("harvest")
     client = RiotClient(settings)
 
+    extracting = bool(args.features_out)
+    keep_raw = args.keep_raw or not extracting
+
     out_dir = Path(args.out).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if keep_raw:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     seeds = _seed_players(client, args, console)
     if not seeds:
@@ -828,14 +889,22 @@ def cmd_harvest(args: argparse.Namespace) -> int:
     console.print(f"  {len(seeds)} seed players, sampling up to "
                   f"{args.per_player} games each")
 
-    seen_matches = {path.name.split(".")[0] for path in out_dir.glob("*.match.json")}
+    seen_matches = {path.name.split(".")[0] for path in out_dir.glob("*.match.json")} \
+        if out_dir.is_dir() else set()
     if seen_matches:
         console.print(Text(f"  {len(seen_matches)} matches already on disk", style="dim"))
+    if extracting:
+        console.print(
+            Text(f"  reducing to features as they arrive -> {args.features_out}"
+                 + ("" if keep_raw else " (raw JSON discarded)"), style="dim")
+        )
 
     queue = None if args.queue == 0 else args.queue
-    written = len(seen_matches)
     target = args.count
+    written = len(seen_matches)
     failures = 0
+    unusable = 0
+    extracted: List[Tuple[List[Any], int]] = []
 
     with console.status("harvesting...") as status:
         for puuid in seeds:
@@ -855,8 +924,6 @@ def cmd_harvest(args: argparse.Namespace) -> int:
                     continue
                 seen_matches.add(match_id)
 
-                match_path = out_dir / f"{match_id}.match.json"
-                timeline_path = out_dir / f"{match_id}.timeline.json"
                 try:
                     match = client.match(match_id)
                     timeline = client.timeline(match_id)
@@ -865,8 +932,21 @@ def cmd_harvest(args: argparse.Namespace) -> int:
                     log.debug("%s: %s", match_id, exc)
                     continue
 
-                match_path.write_text(json.dumps(match), encoding="utf-8")
-                timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+                if keep_raw:
+                    (out_dir / f"{match_id}.match.json").write_text(
+                        json.dumps(match), encoding="utf-8"
+                    )
+                    (out_dir / f"{match_id}.timeline.json").write_text(
+                        json.dumps(timeline), encoding="utf-8"
+                    )
+
+                if extracting:
+                    states, replay = _reduce_match(match, timeline)
+                    if states is None:
+                        unusable += 1
+                    else:
+                        extracted.append((states, replay.winner))
+
                 written += 1
                 status.update(
                     f"harvested {written}/{target} matches  "
@@ -875,11 +955,62 @@ def cmd_harvest(args: argparse.Namespace) -> int:
                 )
 
     console.print(
-        f"\nwrote {written} match/timeline pairs to {out_dir} "
+        f"\nharvested {written} matches "
         f"({client.request_count} API requests, {failures} skipped)"
     )
-    console.print(Text(f"next: rift-oracle train --data {out_dir}", style="dim"))
+    if keep_raw:
+        console.print(Text(f"  raw JSON in {out_dir}", style="dim"))
+
+    if extracting:
+        if not extracted:
+            console.print(
+                Text("no usable games to extract; wrote no shard.", style="yellow")
+            )
+            return 1
+        dataset = dataset_from_games(extracted)
+        meta = {
+            "platform": settings.platform,
+            "queue": args.queue,
+            "games": dataset.n_games,
+            "states": len(dataset),
+            "harvested_at": _utc_now(),
+        }
+        path = dataset.save_npz(Path(args.features_out), meta=meta)
+        size_kb = path.stat().st_size / 1024
+        console.print(
+            f"  wrote {dataset.n_games:,} games / {len(dataset):,} states to {path} "
+            f"({size_kb:,.0f} KB, {unusable} unusable)"
+        )
+        console.print(Text(f"next: rift-oracle train --features {path.parent}", style="dim"))
+    else:
+        console.print(Text(f"next: rift-oracle train --data {out_dir}", style="dim"))
     return 0
+
+
+def _reduce_match(match: Dict[str, Any], timeline: Dict[str, Any]):
+    """Replay one match into states, or ``(None, None)`` if it is unusable.
+
+    Remakes and very short games say nothing about win probability, so they are
+    dropped here rather than being written into a shard that outlives them.
+    """
+    from rift_oracle.game.timeline_adapter import replay_match
+
+    try:
+        states, replay = replay_match(match, timeline, resolution="frames")
+    except (KeyError, TypeError, ValueError) as exc:
+        log.debug("unusable match: %s", exc)
+        return None, None
+    if not states or replay.winner is None:
+        return None, None
+    if replay.game_duration_s and replay.game_duration_s < 8 * 60:
+        return None, None
+    return states, replay
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 #: A spread across the tiers most EUW ranked games are actually played in.
@@ -1249,6 +1380,17 @@ def build_parser() -> argparse.ArgumentParser:
     # train
     p_train = sub.add_parser("train", help="fit the win-probability model")
     p_train.add_argument("--data", help="directory of harvested matches (default: simulate)")
+    p_train.add_argument(
+        "--features", help="file or directory of .npz feature shards from 'harvest --features-out'"
+    )
+    p_train.add_argument(
+        "--compare-to", dest="compare_to",
+        help="only save if this model is beaten on the same held-out games",
+    )
+    p_train.add_argument(
+        "--min-gain", dest="min_gain", type=float, default=0.0,
+        help="log-loss improvement required by --compare-to (default 0)",
+    )
     p_train.add_argument("--games", type=int, default=6000, help="games to simulate")
     p_train.add_argument("--limit", type=int, help="cap on harvested matches to use")
     p_train.add_argument(
@@ -1258,7 +1400,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--seed", type=int, default=7)
     p_train.add_argument("--out", help="write the model here instead of the default location")
     p_train.add_argument("--report", help="write the training report as JSON")
-    p_train.set_defaults(func=cmd_train)
+    p_train.set_defaults(func=cmd_train, features=None, compare_to=None)
 
     # harvest
     p_harvest = sub.add_parser("harvest", help="download matches and timelines to train on")
@@ -1278,9 +1420,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_harvest.add_argument("--page", type=int, default=1, help="ranked-entries page")
     p_harvest.add_argument("--count", type=int, default=200, help="matches to fetch")
     p_harvest.add_argument("--queue", type=int, default=420, help="queue id, 0 for any")
-    p_harvest.add_argument("--out", default="matches", help="output directory")
+    p_harvest.add_argument("--out", default="matches", help="output directory for raw JSON")
+    p_harvest.add_argument(
+        "--features-out", dest="features_out",
+        help="reduce games to feature rows as they arrive and write them here (.npz). "
+             "About 1 MB per thousand games, against 900 MB of raw JSON",
+    )
+    p_harvest.add_argument(
+        "--keep-raw", action="store_true",
+        help="also keep the raw match/timeline JSON when extracting features",
+    )
     p_harvest.add_argument("--seed", type=int, default=0, help="shuffle seed")
-    p_harvest.set_defaults(func=cmd_harvest)
+    p_harvest.set_defaults(func=cmd_harvest, features_out=None, keep_raw=False)
 
     # backtest
     p_backtest = sub.add_parser("backtest", help="score the model and check calibration")

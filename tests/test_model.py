@@ -181,3 +181,145 @@ def test_an_empty_grid_falls_back_to_a_sane_default():
     )
     chosen, search = select_l2(dataset, grid=(), folds=2)
     assert chosen == 2.0 and search == []
+
+# -- feature shards --------------------------------------------------------
+#
+# Shards are what an unattended harvest accumulates. Raw match and timeline
+# JSON is ~900 MB per thousand games; the features those reduce to are ~1 MB,
+# which is the difference between a repo that can keep history and one that
+# cannot.
+
+
+def _dataset(n_games, seed):
+    from rift_oracle.model.train import Dataset
+    from rift_oracle.sim.synth import simulate_dataset
+
+    a = simulate_dataset(n_games=n_games, seed=seed)
+    return Dataset(a["values"], a["masks"], a["times"], a["labels"], a["groups"])
+
+
+def test_a_shard_round_trips(tmp_path):
+    from rift_oracle.model.train import Dataset
+
+    original = _dataset(20, 1)
+    path = original.save_npz(tmp_path / "s.npz", meta={"platform": "euw1"})
+    back = Dataset.load_npz(path)
+
+    assert np.allclose(original.values, back.values, atol=1e-4)
+    assert np.array_equal(original.masks, back.masks)  # packed to bits and back
+    assert np.array_equal(original.labels, back.labels)
+    assert np.array_equal(original.groups, back.groups)
+    assert np.allclose(original.times, back.times, atol=1e-2)
+
+
+def test_a_shard_is_far_smaller_than_the_json_it_came_from(tmp_path):
+    original = _dataset(50, 2)
+    path = original.save_npz(tmp_path / "s.npz")
+    kb_per_1000_games = path.stat().st_size / 1024 / original.n_games * 1000
+    # Raw match+timeline JSON measures ~900_000 KB per thousand games.
+    assert kb_per_1000_games < 5_000
+
+
+def test_shards_carry_nothing_that_identifies_a_player_or_a_game(tmp_path):
+    """A published shard must be feature differences and a win bit, no more."""
+    path = _dataset(10, 3).save_npz(tmp_path / "s.npz")
+    with np.load(path, allow_pickle=False) as payload:
+        assert set(payload.files) == {
+            "values", "masks", "n_features", "times", "labels",
+            "groups", "feature_keys", "fmt", "meta",
+        }
+        blob = path.read_bytes().lower()
+    for leak in (b"puuid", b"summoner", b"riotid", b"euw1_", b"na1_"):
+        assert leak not in blob
+
+
+def test_concatenating_shards_renumbers_games(tmp_path):
+    """Two shards both number their games from zero."""
+    from rift_oracle.model.train import Dataset
+
+    a, b = _dataset(12, 4), _dataset(9, 5)
+    assert a.groups.min() == b.groups.min() == 0
+
+    merged = Dataset.concat([a, b])
+    assert merged.n_games == a.n_games + b.n_games
+    assert len(merged) == len(a) + len(b)
+    # Without renumbering, a split promising to hold out whole games would
+    # leak across the shard boundary.
+    _train, test = merged.split_by_game(test_fraction=0.3, seed=0)
+    assert set(test.groups).isdisjoint(set(_train.groups))
+
+
+def test_a_directory_of_shards_loads_as_one_dataset(tmp_path):
+    from rift_oracle.model.train import Dataset
+
+    _dataset(8, 6).save_npz(tmp_path / "2026-09-17-euw1.npz")
+    _dataset(7, 7).save_npz(tmp_path / "2026-09-24-na1.npz")
+    merged = Dataset.load_shards(tmp_path)
+    assert merged.n_games == 15
+
+
+def test_a_shard_from_a_different_feature_set_is_refused(tmp_path):
+    """Silently mixing incompatible shards would be worse than refusing."""
+    import numpy as np_
+
+    from rift_oracle.config import RiftOracleError
+    from rift_oracle.model.train import Dataset
+
+    path = _dataset(5, 8).save_npz(tmp_path / "s.npz")
+    with np_.load(path, allow_pickle=False) as payload:
+        fields = {k: payload[k] for k in payload.files}
+    fields["feature_keys"] = np_.array(["not", "the", "same", "features"])
+    np_.savez_compressed(path, **fields)
+
+    with pytest.raises(RiftOracleError, match="different feature set"):
+        Dataset.load_npz(path)
+
+
+def test_an_unreadable_format_version_is_refused(tmp_path):
+    import numpy as np_
+
+    from rift_oracle.config import RiftOracleError
+    from rift_oracle.model.train import Dataset
+
+    path = _dataset(5, 9).save_npz(tmp_path / "s.npz")
+    with np_.load(path, allow_pickle=False) as payload:
+        fields = {k: payload[k] for k in payload.files}
+    fields["fmt"] = np_.array(["rift_oracle.dataset.v99"])
+    np_.savez_compressed(path, **fields)
+
+    with pytest.raises(RiftOracleError, match="format"):
+        Dataset.load_npz(path)
+
+
+def test_the_committed_shards_train_a_model_without_an_api_key():
+    """The repo ships features, not raw data, so it is trainable offline."""
+    from pathlib import Path
+
+    from rift_oracle.model.train import Dataset
+
+    shards = Path(__file__).resolve().parent.parent / "data" / "features"
+    if not list(shards.glob("*.npz")):
+        pytest.skip("no shards committed")
+    data = Dataset.load_shards(shards)
+    assert data.n_games > 100
+    assert len(data) > 1000
+    assert set(np.unique(data.labels)) <= {0.0, 1.0}
+
+
+def test_a_new_model_is_only_preferred_when_it_beats_the_old_one():
+    """The guard an unattended retrain leans on."""
+    from rift_oracle.model.train import compare_on_holdout, train_model
+
+    data = _dataset(120, 11)
+    good, _report = train_model(data, l2=2.0, seed=0, test_fraction=0.01)
+
+    from rift_oracle.model.gam import AdditiveWinModel
+
+    useless = AdditiveWinModel()  # all-zero weights: says 50% to everything
+
+    verdict = compare_on_holdout(data, good, useless, seed=0)
+    assert verdict["comparable"]
+    assert verdict["log_loss_gain"] > 0  # the fitted model wins
+
+    reversed_verdict = compare_on_holdout(data, useless, good, seed=0)
+    assert reversed_verdict["log_loss_gain"] < 0
