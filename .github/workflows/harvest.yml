@@ -191,7 +191,6 @@ jobs:
         if: steps.shards.outputs.added != '0'
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
-          import os
           from pathlib import Path
           from rift_oracle.model.train import Dataset
           data = Dataset.load_shards(Path("data/features"))
@@ -214,8 +213,8 @@ jobs:
           git commit -F - <<COMMIT
           Weekly harvest: ${{ steps.totals.outputs.games }} games across ${{ steps.totals.outputs.shards }} shards
 
-          ${{ steps.shards.outputs.added }} new shard(s), ${{ steps.shards.outputs.pruned }} pruned
-          past the ${{ env.KEEP_WEEKS }}-week window. Model: ${{ steps.retrain.outputs.model || 'unchanged' }}.
+          ${{ steps.shards.outputs.added }} shard(s) added, ${{ steps.shards.outputs.pruned }} pruned past the ${{ env.KEEP_WEEKS }}-week window.
+          Model: ${{ steps.retrain.outputs.model || 'unchanged' }}.
 
           The shards hold ${{ steps.totals.outputs.states }} evaluated states. The raw match and
           timeline JSON they came from is not kept: it runs to roughly 900 MB per
