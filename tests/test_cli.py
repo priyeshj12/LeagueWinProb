@@ -1,6 +1,7 @@
 """End-to-end: the commands that need no API key, and the report renderers."""
 
 import json
+import os
 import re
 
 import pytest
@@ -87,7 +88,7 @@ def test_html_escapes_champion_names(tmp_path, model):
 
     game = simulate_game(seed=2)
     for player in game.states[-1].blue.players:
-            player.champion = '<img src=x onerror=alert(1)>'
+        player.champion = '<img src=x onerror=alert(1)>'
     track = build_track(game.states, model, winner=game.winner)
     body = render_html(
         track, detect_swings(track), {"blue_champions": ['<script>bad()</script>'],
@@ -106,7 +107,7 @@ def test_terminal_report_renders_without_swings(model):
 
     game = simulate_game(seed=21)
     track = build_track(game.states, model, winner=game.winner)
-    console = Console(file=open("/dev/null", "w"), width=100)
+    console = Console(file=open(os.devnull, "w"), width=100)
     render_report(track, [], game.summary(), console, BLUE, advice=None)
 
 
@@ -189,5 +190,5 @@ def test_draft_projection_reflects_which_composition_scales(model, capsys):
     mirror = odds_at(5, late, late), odds_at(40, late, late)
     assert abs(mirror[0] - mirror[1]) < 0.02
 
-    console = Console(width=90, file=open("/dev/null", "w"))
+    console = Console(width=90, file=open(os.devnull, "w"))
     _print_draft_projection(console, model, game, late, early, 0.0, BLUE)
